@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "touchpoint-py"
+version = "0.1.1"
+description = "Cross-platform unified accessibility API for AI agents"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Sepehr Movassat"},
+    {name = "David Park"},
+]
+keywords = [
+    "accessibility",
+    "ui-automation",
+    "desktop-automation",
+    "ai-agents",
+    "mcp",
+    "gui-automation",
+    "screen-reader",
+    "at-spi2",
+    "uia",
+    "cdp",
+    "cross-platform",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "PyGObject>=3.42; sys_platform == 'linux'",
+    "comtypes>=1.2; sys_platform == 'win32'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+    "rapidfuzz>=3.0",
+    "websocket-client>=1.0",
+    "Pillow>=10.0",
+    "screeninfo>=0.8",
+    "mcp[cli]>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.urls]
+Homepage = "https://github.com/Touchpoint-Labs/touchpoint"
+Repository = "https://github.com/Touchpoint-Labs/touchpoint"
+Issues = "https://github.com/Touchpoint-Labs/touchpoint/issues"
+
+[project.scripts]
+touchpoint-mcp = "touchpoint.mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["touchpoint*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: pure logic, no OS needed",
+    "integration: needs live desktop + backend",
+    "realistic: agent-style workflows, opt-in",
+    "slow: takes >5 s",
+    "destructive: modifies UI state (types, clicks)",
+    "cdp: requires a CDP connection (Chrome/Electron with --remote-debugging-port)",
+]
