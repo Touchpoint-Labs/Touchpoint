@@ -2666,8 +2666,8 @@ class CdpBackend(Backend):
                 "functionDeclaration": (
                     "function(s, e) {"
                     "  if (typeof this.setSelectionRange === 'function') {"
-                    "    this.setSelectionRange(s, e);"
-                    "    return true;"
+                    "    try { this.setSelectionRange(s, e); return true; }"
+                    "    catch(_) {}"
                     "  }"
                     "  if (this.isContentEditable || this.nodeType === 3) {"
                     "    var tw = document.createTreeWalker("
