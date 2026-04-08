@@ -2033,6 +2033,89 @@ def set_value(
         return True
 
 
+def select_text(
+    element: Element | str,
+    text: str,
+    *,
+    occurrence: int = 1,
+) -> bool:
+    """Select a substring within an element's text content.
+
+    Reads the element's text, locates the *occurrence*-th match
+    of *text*, and applies a native text selection over that range.
+
+    Args:
+        element: An :class:`Element` or an element id string.
+        text: The substring to select.
+        occurrence: Which occurrence to select (1-based).
+            Defaults to the first.
+
+    Returns:
+        ``True`` if the selection was applied.
+
+    Raises:
+        ActionFailedError: If the element does not support text
+            selection, the substring is not found, or the backend
+            rejects the selection.
+
+    Example::
+
+        >>> import touchpoint as tp
+        >>> tp.select_text("atspi:2269:1:2.1", "hello")
+        True
+        >>> tp.select_text("atspi:2269:1:2.1", "world", occurrence=2)
+        True
+    """
+    from touchpoint.core.exceptions import ActionFailedError
+
+    eid = _resolve_target(element)
+
+    if not text:
+        raise ActionFailedError(
+            action="select_text",
+            element_id=eid,
+            reason="text must be a non-empty string",
+        )
+    if occurrence < 1:
+        raise ActionFailedError(
+            action="select_text",
+            element_id=eid,
+            reason=f"occurrence must be >= 1, got {occurrence}",
+        )
+
+    # Get the element's current text content.
+    el = get_element(eid)
+    if el is None:
+        raise ActionFailedError(
+            action="select_text",
+            element_id=eid,
+            reason="element not found",
+        )
+
+    content = el.value
+    if content is None:
+        raise ActionFailedError(
+            action="select_text",
+            element_id=eid,
+            reason="element has no text content",
+        )
+
+    # Find the n-th occurrence of the substring.
+    start = -1
+    for _ in range(occurrence):
+        start = content.find(text, start + 1)
+        if start == -1:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=eid,
+                reason=f"substring {text!r} not found "
+                       f"(occurrence {occurrence})",
+            )
+
+    end = start + len(text)
+    return _backend_for_id(eid).select_text(eid, start, end)
+
+
 def focus(element: Element | str) -> bool:
     """Move keyboard focus to an element.
 
@@ -2841,6 +2924,7 @@ __all__ = [
     "set_value",
     "set_numeric_value",
     "focus",
+    "select_text",
     "action",
     # Raw input (InputProvider)
     "type_text",

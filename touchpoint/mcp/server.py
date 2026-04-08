@@ -811,6 +811,28 @@ def focus(element_id: str) -> str:
 
 
 @mcp.tool()
+def select_text(element_id: str, text: str, occurrence: int = 1) -> str:
+    """Select a substring within an element's text content.
+
+    Finds the text within the element and applies a native text
+    selection over that range.  Useful for formatting, copying,
+    or replacing specific text within a document or text field.
+
+    Args:
+        element_id: The element ID containing the text.
+        text: The exact substring to select.
+        occurrence: Which occurrence to select (1 = first, 2 = second, etc.).
+    """
+    try:
+        return _ok(
+            "select_text",
+            tp.select_text(_resolve(element_id), text, occurrence=occurrence),
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool()
 def action(element_id: str, action_name: str) -> str:
     """Perform a raw accessibility action by exact name.
 

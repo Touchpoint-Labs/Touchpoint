@@ -971,6 +971,20 @@ class UiaBackend(Backend):
                 reason=str(exc),
             ) from exc
 
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within an element via UIA.
+
+        TODO: Implement using ``ITextRangeProvider.Select()``
+        via the ``TextPattern``.
+        """
+        raise ActionFailedError(
+            action="select_text",
+            element_id=element_id,
+            reason="select_text not yet implemented for UIA backend",
+        )
+
     def activate_window(self, window_id: str) -> bool:
         """Bring a window to the foreground via UIA.
 

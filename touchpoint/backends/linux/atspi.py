@@ -1060,6 +1060,65 @@ class AtSpiBackend(Backend):
                    "(no Component interface and no focus action)",
         )
 
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within an element via AT-SPI2.
+
+        Uses the ``Text`` interface's selection methods.  Clears any
+        existing selections first, then adds the requested range.
+
+        Args:
+            element_id: The target element's id.
+            start: Start offset (0-based character index).
+            end: End offset (exclusive).
+
+        Returns:
+            ``True`` if the selection was applied.
+
+        Raises:
+            ActionFailedError: If the element does not implement the
+                Text interface or the selection fails.
+        """
+        acc = self._resolve_element(element_id)
+        if acc is None:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="element not found in the accessibility tree",
+            )
+
+        Atspi = self._atspi
+
+        # Check for the Text interface.
+        try:
+            text_iface = acc.get_text_iface()
+        except Exception:
+            text_iface = None
+
+        if text_iface is None:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="element does not support the Text interface",
+            )
+
+        try:
+            # Clear existing selections.
+            n_sel = Atspi.Text.get_n_selections(acc)
+            for i in range(n_sel - 1, -1, -1):
+                Atspi.Text.remove_selection(acc, i)
+
+            # Add the requested selection.
+            result = Atspi.Text.add_selection(acc, start, end)
+            return bool(result)
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=str(exc),
+            ) from exc
+
     def activate_window(self, window_id: str) -> bool:
         """Bring a window to the foreground via AT-SPI2.
 

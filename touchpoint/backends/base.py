@@ -288,6 +288,30 @@ class Backend(ABC):
                 cannot receive focus.
         """
 
+    # -- Text selection ---------------------------------------------------
+
+    @abstractmethod
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within an element.
+
+        Backends should use the native text selection mechanism
+        available on their platform.
+
+        Args:
+            element_id: The ``id`` of the target element.
+            start: Start offset (0-based character index).
+            end: End offset (exclusive).
+
+        Returns:
+            ``True`` if the selection was applied.
+
+        Raises:
+            ActionFailedError: If the element does not support text
+                selection or the operation fails.
+        """
+
     # -- Window management ------------------------------------------------
 
     def activate_window(self, window_id: str) -> bool:

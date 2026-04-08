@@ -2609,6 +2609,121 @@ class CdpBackend(Backend):
                 reason=f"DOM.focus failed: {exc}",
             ) from exc
 
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within a CDP element.
+
+        For ``<input>`` and ``<textarea>`` elements, uses
+        ``setSelectionRange()``.  For contentEditable elements
+        and other text nodes, uses the ``Selection`` API with
+        ``setBaseAndExtent()``.
+        """
+        parts = self._parse_id(element_id)
+        port = parts["port"]
+        target_id = parts["target_id"]
+        node_id = parts["node_id"]
+
+        backend_nid = self._resolve_backend_node_id(
+            port, target_id, node_id,
+        )
+        if backend_nid is None:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="element not found in the accessibility tree",
+            )
+
+        # Focus the element first.
+        try:
+            self._send(port, target_id, "DOM.focus", {
+                "backendNodeId": backend_nid,
+            })
+        except Exception:
+            pass  # best-effort — continue to select anyway
+
+        # Resolve to a JS object reference.
+        try:
+            resolve_result = self._send(
+                port, target_id, "DOM.resolveNode",
+                {"backendNodeId": backend_nid},
+            )
+            object_id = resolve_result.get(
+                "object", {},
+            ).get("objectId")
+            if not object_id:
+                raise RuntimeError("resolveNode returned no objectId")
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=f"cannot resolve element: {exc}",
+            ) from exc
+
+        try:
+            result = self._send(port, target_id, "Runtime.callFunctionOn", {
+                "objectId": object_id,
+                "functionDeclaration": (
+                    "function(s, e) {"
+                    "  if (typeof this.setSelectionRange === 'function') {"
+                    "    this.setSelectionRange(s, e);"
+                    "    return true;"
+                    "  }"
+                    "  if (this.isContentEditable || this.nodeType === 3) {"
+                    "    var tw = document.createTreeWalker("
+                    "      this, NodeFilter.SHOW_TEXT, null, false);"
+                    "    var node, charCount = 0, startNode, startOff, endNode, endOff;"
+                    "    while ((node = tw.nextNode())) {"
+                    "      var len = node.textContent.length;"
+                    "      if (!startNode && charCount + len > s) {"
+                    "        startNode = node; startOff = s - charCount;"
+                    "      }"
+                    "      if (!endNode && charCount + len >= e) {"
+                    "        endNode = node; endOff = e - charCount; break;"
+                    "      }"
+                    "      charCount += len;"
+                    "    }"
+                    "    if (!startNode || !endNode) return false;"
+                    "    var sel = window.getSelection();"
+                    "    var range = document.createRange();"
+                    "    range.setStart(startNode, startOff);"
+                    "    range.setEnd(endNode, endOff);"
+                    "    sel.removeAllRanges();"
+                    "    sel.addRange(range);"
+                    "    return true;"
+                    "  }"
+                    "  return false;"
+                    "}"
+                ),
+                "arguments": [{"value": start}, {"value": end}],
+                "returnByValue": True,
+            })
+            success = result.get("result", {}).get("value", False)
+            if not success:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="element does not support text selection "
+                           "(not an input, textarea, or contentEditable)",
+                )
+            return True
+        except ActionFailedError:
+            raise
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=f"selection failed: {exc}",
+            ) from exc
+        finally:
+            try:
+                self._send(
+                    port, target_id, "Runtime.releaseObject",
+                    {"objectId": object_id},
+                )
+            except Exception:
+                pass
+
     def activate_window(self, window_id: str) -> bool:
         """Activate a CDP window (browser tab).
 

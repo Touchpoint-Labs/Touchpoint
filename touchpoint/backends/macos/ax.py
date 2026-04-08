@@ -1214,6 +1214,19 @@ class AxBackend(Backend):
                    "and has no focus action",
         )
 
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within an element via macOS AX.
+
+        TODO: Implement using settable ``AXSelectedTextRange``.
+        """
+        raise ActionFailedError(
+            action="select_text",
+            element_id=element_id,
+            reason="select_text not yet implemented for macOS AX backend",
+        )
+
     def activate_window(self, window_id: str) -> bool:
         """Bring a window to the foreground via macOS AX.
 
