@@ -2092,8 +2092,8 @@ def select_text(
             reason="element not found",
         )
 
-    content = el.value
-    if content is None:
+    content = el.value if el.value is not None else el.name
+    if not content:
         raise ActionFailedError(
             action="select_text",
             element_id=eid,
