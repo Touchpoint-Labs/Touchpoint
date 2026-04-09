@@ -3426,6 +3426,18 @@ class CdpBackend(Backend):
 
         return None
 
+    def _release_object(
+        self, port: int, target_id: str, object_id: str,
+    ) -> None:
+        """Release a JS object reference (best-effort, ignore errors)."""
+        try:
+            self._send(
+                port, target_id, "Runtime.releaseObject",
+                {"objectId": object_id},
+            )
+        except Exception:
+            pass
+
     def _click_element(
         self,
         port: int,
@@ -3454,8 +3466,8 @@ class CdpBackend(Backend):
             object_id = None
 
         if object_id:
-            # Atomic JS: scrollIntoView + getBoundingClientRect in one call.
-            # Returns fresh viewport-relative coordinates after scroll.
+            # Try to get coordinates via scrollIntoView + getBoundingClientRect.
+            x = y = None
             expr = (
                 "(function(){"
                 "this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});"
@@ -3474,71 +3486,62 @@ class CdpBackend(Backend):
                     },
                 )
                 val = js_result.get("result", {}).get("value")
-                if val and len(val) >= 2 and val[2] > 0 and val[3] > 0:
+                if val and len(val) >= 4 and val[2] > 0 and val[3] > 0:
                     x = round(val[0])
                     y = round(val[1])
-                else:
-                    # Element has no visible geometry — fall back to
-                    # JS event dispatch which works even on elements
-                    # that have no layout (e.g. autocomplete options
-                    # mid-render, off-screen items).
-                    js_click_fn = {
-                        "click": "function() { this.click(); }",
-                        "double_click": (
-                            "function() {"
-                            "  this.dispatchEvent(new MouseEvent("
-                            "    'dblclick', {bubbles:true, cancelable:true}));"
-                            "}"
-                        ),
-                        "right_click": (
-                            "function() {"
-                            "  this.dispatchEvent(new MouseEvent("
-                            "    'contextmenu', {bubbles:true, cancelable:true}));"
-                            "}"
-                        ),
-                    }.get(action)
-                    if js_click_fn is None:
-                        raise ActionFailedError(
-                            action=action,
-                            element_id=element_id,
-                            reason="element has no visible geometry",
-                        )
-                    try:
-                        self._send(
-                            port, target_id,
-                            "Runtime.callFunctionOn",
-                            {
-                                "functionDeclaration": js_click_fn,
-                                "objectId": object_id,
-                            },
-                        )
-                        return True
-                    except ActionFailedError:
-                        raise
-                    except Exception as js_exc:
-                        raise ActionFailedError(
-                            action=action,
-                            element_id=element_id,
-                            reason=f"element has no visible geometry "
-                                   f"and JS click also failed: {js_exc}",
-                        ) from js_exc
-            except ActionFailedError:
-                raise
-            except Exception as exc:
-                raise ActionFailedError(
-                    action=action,
-                    element_id=element_id,
-                    reason=f"cannot compute click target: {exc}",
-                ) from exc
-            finally:
+            except Exception:
+                pass  # coordinates unavailable — try JS fallback below
+
+            if x is None or y is None:
+                # No coordinates (zero geometry, JS threw, or detached
+                # element).  Fall back to JS event dispatch which works
+                # even on elements with no layout.
+                js_click_fn = {
+                    "click": "function() { this.click(); }",
+                    "double_click": (
+                        "function() {"
+                        "  this.dispatchEvent(new MouseEvent("
+                        "    'dblclick', {bubbles:true, cancelable:true}));"
+                        "}"
+                    ),
+                    "right_click": (
+                        "function() {"
+                        "  this.dispatchEvent(new MouseEvent("
+                        "    'contextmenu', {bubbles:true, cancelable:true}));"
+                        "}"
+                    ),
+                }.get(action)
+                if js_click_fn is None:
+                    self._release_object(port, target_id, object_id)
+                    raise ActionFailedError(
+                        action=action,
+                        element_id=element_id,
+                        reason="element has no visible geometry",
+                    )
                 try:
                     self._send(
                         port, target_id,
-                        "Runtime.releaseObject",
-                        {"objectId": object_id},
+                        "Runtime.callFunctionOn",
+                        {
+                            "functionDeclaration": js_click_fn,
+                            "objectId": object_id,
+                        },
                     )
-                except Exception:
-                    pass
+                    return True
+                except ActionFailedError:
+                    raise
+                except Exception as js_exc:
+                    raise ActionFailedError(
+                        action=action,
+                        element_id=element_id,
+                        reason=f"element has no visible geometry "
+                               f"and JS click also failed: {js_exc}",
+                    ) from js_exc
+                finally:
+                    self._release_object(port, target_id, object_id)
+
+            # Got coordinates — release JS ref, then dispatch mouse events.
+            self._release_object(port, target_id, object_id)
         else:
             # Fallback: use the two-step approach if resolveNode fails
             # (e.g. for synthetic AX nodes with no DOM backing).
@@ -3567,6 +3570,51 @@ class CdpBackend(Backend):
             model = result.get("model", {})
             content = model.get("content", [])
             if not content or len(content) < 8:
+                # No geometry from getBoxModel either — try resolving
+                # to a JS object for element.click() as last resort.
+                try:
+                    resolve2 = self._send(
+                        port, target_id, "DOM.resolveNode",
+                        {"backendNodeId": backend_nid},
+                    )
+                    oid2 = resolve2.get("object", {}).get("objectId")
+                    if oid2:
+                        js_fn = {
+                            "click": "function() { this.click(); }",
+                            "double_click": (
+                                "function() {"
+                                "  this.dispatchEvent(new MouseEvent("
+                                "    'dblclick', {bubbles:true, cancelable:true}));"
+                                "}"
+                            ),
+                            "right_click": (
+                                "function() {"
+                                "  this.dispatchEvent(new MouseEvent("
+                                "    'contextmenu', {bubbles:true, cancelable:true}));"
+                                "}"
+                            ),
+                        }.get(action)
+                        if js_fn:
+                            try:
+                                self._send(
+                                    port, target_id,
+                                    "Runtime.callFunctionOn",
+                                    {"functionDeclaration": js_fn, "objectId": oid2},
+                                )
+                                return True
+                            finally:
+                                self._release_object(port, target_id, oid2)
+                        else:
+                            self._release_object(port, target_id, oid2)
+                except ActionFailedError:
+                    raise
+                except Exception as fallback_exc:
+                    raise ActionFailedError(
+                        action=action,
+                        element_id=element_id,
+                        reason=f"element has no visible geometry "
+                               f"and JS click fallback failed: {fallback_exc}",
+                    ) from fallback_exc
                 raise ActionFailedError(
                     action=action,
                     element_id=element_id,
