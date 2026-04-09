@@ -222,6 +222,11 @@ class AtSpiBackend(Backend):
         "right_click": ["ShowMenu", "show_menu"],
     }
 
+    # Maximum children to iterate per accessible node.  Prevents
+    # pathological cases like LibreOffice Calc's TABLE accessible
+    # that reports get_child_count() == 2_147_483_647 (INT_MAX).
+    _MAX_CHILDREN_PER_NODE: int = 500
+
     def __init__(self) -> None:
         self._atspi = _import_atspi()
         # Cache accessible objects during lightweight walks so
@@ -596,7 +601,12 @@ class AtSpiBackend(Backend):
             win_id = ":".join(parts[:3]) if len(parts) >= 3 else None
 
             elements: list[Element] = []
-            for i in range(acc.get_child_count()):
+            # Cap iteration per node — some apps (e.g.
+            # LibreOffice Calc) report INT_MAX children for
+            # spreadsheet tables, causing the walk to hang.
+            child_count = min(acc.get_child_count(),
+                              self._MAX_CHILDREN_PER_NODE)
+            for i in range(child_count):
                 if self._element_count >= self._max_elements:
                     break
                 child = acc.get_child_at_index(i)
@@ -648,7 +658,8 @@ class AtSpiBackend(Backend):
                 )
             except Exception:
                 self._walk_scale = get_scale_factor()
-            for i in range(win_acc.get_child_count()):
+            for i in range(min(win_acc.get_child_count(),
+                               self._MAX_CHILDREN_PER_NODE)):
                 if self._element_count >= self._max_elements:
                     break
                 child = win_acc.get_child_at_index(i)
@@ -1492,7 +1503,8 @@ class AtSpiBackend(Backend):
         if self._element_count >= self._max_elements:
             return
         try:
-            n_children = acc.get_child_count()
+            n_children = min(acc.get_child_count(),
+                             self._MAX_CHILDREN_PER_NODE)
         except Exception:
             return
         for i in range(n_children):
@@ -1692,7 +1704,8 @@ class AtSpiBackend(Backend):
         if self._element_count >= self._max_elements:
             return
         try:
-            n_children = acc.get_child_count()
+            n_children = min(acc.get_child_count(),
+                             self._MAX_CHILDREN_PER_NODE)
         except Exception:
             return
         for i in range(n_children):
@@ -1757,7 +1770,9 @@ class AtSpiBackend(Backend):
         if (self._skip_subtree_roles is not None
                 and element.role in self._skip_subtree_roles):
             return element
-        for i in range(acc.get_child_count()):
+        child_count = min(acc.get_child_count(),
+                          self._MAX_CHILDREN_PER_NODE)
+        for i in range(child_count):
             if self._element_count >= self._max_elements:
                 break
             child = acc.get_child_at_index(i)
