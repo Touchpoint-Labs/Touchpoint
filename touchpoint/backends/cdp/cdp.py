@@ -3496,7 +3496,7 @@ class CdpBackend(Backend):
                             "    'contextmenu', {bubbles:true, cancelable:true}));"
                             "}"
                         ),
-                    }.get(action_lower)
+                    }.get(action)
                     if js_click_fn is None:
                         raise ActionFailedError(
                             action=action,
