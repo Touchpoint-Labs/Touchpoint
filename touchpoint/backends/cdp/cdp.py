@@ -3478,7 +3478,50 @@ class CdpBackend(Backend):
                     x = round(val[0])
                     y = round(val[1])
                 else:
-                    raise RuntimeError("element has no visible geometry")
+                    # Element has no visible geometry — fall back to
+                    # JS event dispatch which works even on elements
+                    # that have no layout (e.g. autocomplete options
+                    # mid-render, off-screen items).
+                    js_click_fn = {
+                        "click": "function() { this.click(); }",
+                        "double_click": (
+                            "function() {"
+                            "  this.dispatchEvent(new MouseEvent("
+                            "    'dblclick', {bubbles:true, cancelable:true}));"
+                            "}"
+                        ),
+                        "right_click": (
+                            "function() {"
+                            "  this.dispatchEvent(new MouseEvent("
+                            "    'contextmenu', {bubbles:true, cancelable:true}));"
+                            "}"
+                        ),
+                    }.get(action_lower)
+                    if js_click_fn is None:
+                        raise ActionFailedError(
+                            action=action,
+                            element_id=element_id,
+                            reason="element has no visible geometry",
+                        )
+                    try:
+                        self._send(
+                            port, target_id,
+                            "Runtime.callFunctionOn",
+                            {
+                                "functionDeclaration": js_click_fn,
+                                "objectId": object_id,
+                            },
+                        )
+                        return True
+                    except ActionFailedError:
+                        raise
+                    except Exception as js_exc:
+                        raise ActionFailedError(
+                            action=action,
+                            element_id=element_id,
+                            reason=f"element has no visible geometry "
+                                   f"and JS click also failed: {js_exc}",
+                        ) from js_exc
             except ActionFailedError:
                 raise
             except Exception as exc:
