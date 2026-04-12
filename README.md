@@ -147,7 +147,7 @@ tp.elements(app="Slack", format="json")     # full JSON with all fields
 
 ## MCP Server
 
-Touchpoint ships an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server with **19 tools**, ready for any MCP-compatible client. Use it to let LLM agents like Claude, Cursor, or Copilot control your desktop.
+Touchpoint ships an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server with **20 tools**, ready for any MCP-compatible client. Use it to let LLM agents like Claude, Cursor, or Copilot control your desktop.
 
 ### Tools
 
@@ -155,7 +155,7 @@ Touchpoint ships an [MCP (Model Context Protocol)](https://modelcontextprotocol.
 |----------|-------|
 | **Discovery** | `apps`, `windows`, `find`, `elements`, `get_element` |
 | **Screenshot** | `screenshot` (returns image data the LLM can see) |
-| **Actions** | `click` (left/right/double), `set_value`, `set_numeric_value`, `focus`, `action` |
+| **Actions** | `click` (left/right/double), `set_value`, `set_numeric_value`, `select_text`, `focus`, `action` |
 | **Keyboard** | `type_text`, `press_key` (single key or combo) |
 | **Mouse** | `mouse_move`, `scroll` |
 | **Window** | `activate_window` |
@@ -381,6 +381,7 @@ CDP results are merged with native backend results — you get the toolbar and w
 | `tp.right_click(element)` | Right-click / context menu |
 | `tp.set_value(element, text)` | Set text content (`replace=True` to clear first) |
 | `tp.set_numeric_value(element, n)` | Set slider or spinbox value |
+| `tp.select_text(element, text, occurrence=1)` | Select a substring within text content (Linux + web) |
 | `tp.focus(element)` | Move keyboard focus |
 | `tp.action(element, name)` | Execute a raw accessibility action by name |
 | `tp.activate_window(window)` | Bring a window to the foreground |

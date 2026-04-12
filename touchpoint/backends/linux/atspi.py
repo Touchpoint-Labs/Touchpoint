@@ -778,6 +778,10 @@ class AtSpiBackend(Backend):
                     n = current.get_child_count()
                 except Exception:
                     break
+                # Cap children-per-node — LibreOffice Calc tables report
+                # INT_MAX children which would hang this descent loop.
+                # Same fix as the bulk-walk paths (commit 1e298b2).
+                n = min(n, self._MAX_CHILDREN_PER_NODE)
                 for i in range(n):
                     child = current.get_child_at_index(i)
                     if child is None:
