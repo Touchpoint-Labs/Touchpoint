@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 import touchpoint as tp
+import touchpoint._state as _st
 from touchpoint.core.types import State
 from tests.conftest import skip_without_backend
 
@@ -23,23 +24,27 @@ class TestConfigureKeys:
 
     def test_fuzzy_threshold(self):
         tp.configure(fuzzy_threshold=0.8)
-        assert tp._config["fuzzy_threshold"] == 0.8
+        assert _st._config["fuzzy_threshold"] == 0.8
 
     def test_fallback_input(self):
         tp.configure(fallback_input=False)
-        assert tp._config["fallback_input"] is False
+        assert _st._config["fallback_input"] is False
 
     def test_type_chunk_size(self):
         tp.configure(type_chunk_size=100)
-        assert tp._config["type_chunk_size"] == 100
+        assert _st._config["type_chunk_size"] == 100
 
     def test_max_elements(self):
         tp.configure(max_elements=2000)
-        assert tp._config["max_elements"] == 2000
+        assert _st._config["max_elements"] == 2000
 
     def test_max_depth(self):
         tp.configure(max_depth=5)
-        assert tp._config["max_depth"] == 5
+        assert _st._config["max_depth"] == 5
+
+    def test_ax_messaging_timeout(self):
+        tp.configure(ax_messaging_timeout=0.5)
+        assert _st._config["ax_messaging_timeout"] == 0.5
 
 
 # -----------------------------------------------------------------------
@@ -52,17 +57,17 @@ class TestConfigureBehaviour:
 
     def test_multiple_keys(self):
         tp.configure(fuzzy_threshold=0.8, fallback_input=False)
-        assert tp._config["fuzzy_threshold"] == 0.8
-        assert tp._config["fallback_input"] is False
+        assert _st._config["fuzzy_threshold"] == 0.8
+        assert _st._config["fallback_input"] is False
 
     def test_invalid_key(self):
         with pytest.raises(ValueError, match="unknown config key"):
             tp.configure(nonexistent_key=42)
 
     def test_preserves_other_keys(self):
-        original_fallback = tp._config["fallback_input"]
+        original_fallback = _st._config["fallback_input"]
         tp.configure(fuzzy_threshold=0.9)
-        assert tp._config["fallback_input"] == original_fallback
+        assert _st._config["fallback_input"] == original_fallback
 
 
 # -----------------------------------------------------------------------
@@ -76,17 +81,17 @@ class TestConfigureBoundaries:
     def test_fuzzy_threshold_zero(self):
         """0.0 is a valid threshold (loosest — any fuzzy score passes)."""
         tp.configure(fuzzy_threshold=0.0)
-        assert tp._config["fuzzy_threshold"] == 0.0
+        assert _st._config["fuzzy_threshold"] == 0.0
 
     def test_fuzzy_threshold_one(self):
         """1.0 is a valid threshold (strictest — only perfect matches)."""
         tp.configure(fuzzy_threshold=1.0)
-        assert tp._config["fuzzy_threshold"] == 1.0
+        assert _st._config["fuzzy_threshold"] == 1.0
 
     def test_type_chunk_size_zero(self):
         """0 disables chunking (no splitting of typed text)."""
         tp.configure(type_chunk_size=0)
-        assert tp._config["type_chunk_size"] == 0
+        assert _st._config["type_chunk_size"] == 0
 
     def test_fuzzy_threshold_negative_raises(self):
         """Negative fuzzy_threshold raises ValueError."""
@@ -138,7 +143,7 @@ class TestConfigureBoundaries:
     def test_max_elements_one(self):
         """1 is the minimum valid value."""
         tp.configure(max_elements=1)
-        assert tp._config["max_elements"] == 1
+        assert _st._config["max_elements"] == 1
 
     def test_max_elements_zero_raises(self):
         """0 is not a positive integer."""
@@ -167,12 +172,12 @@ class TestConfigureBoundaries:
     def test_max_depth_one(self):
         """1 is the minimum valid value."""
         tp.configure(max_depth=1)
-        assert tp._config["max_depth"] == 1
+        assert _st._config["max_depth"] == 1
 
     def test_max_depth_zero_accepted(self):
         """0 is valid — returns only immediate children."""
         tp.configure(max_depth=0)
-        assert tp._config["max_depth"] == 0
+        assert _st._config["max_depth"] == 0
 
     def test_max_depth_negative_raises(self):
         with pytest.raises(ValueError, match="max_depth"):
@@ -191,20 +196,36 @@ class TestConfigureBoundaries:
         with pytest.raises(ValueError, match="max_depth"):
             tp.configure(max_depth="10")
 
+    def test_ax_messaging_timeout_zero_raises(self):
+        with pytest.raises(ValueError, match="ax_messaging_timeout"):
+            tp.configure(ax_messaging_timeout=0)
+
+    def test_ax_messaging_timeout_negative_raises(self):
+        with pytest.raises(ValueError, match="ax_messaging_timeout"):
+            tp.configure(ax_messaging_timeout=-1)
+
+    def test_ax_messaging_timeout_bool_raises(self):
+        with pytest.raises(ValueError, match="ax_messaging_timeout"):
+            tp.configure(ax_messaging_timeout=True)
+
+    def test_ax_messaging_timeout_string_raises(self):
+        with pytest.raises(ValueError, match="ax_messaging_timeout"):
+            tp.configure(ax_messaging_timeout="slow")
+
     def test_type_chunk_size_invalidates_input_provider(self):
         """Changing type_chunk_size clears _input_provider so the
         next call re-creates it with the new value."""
         # Force provider into existence if possible.
-        saved = tp._input_provider
+        saved = _st._input_provider
         try:
-            tp._input_provider = object()  # sentinel
+            _st._input_provider = object()  # sentinel
             tp.configure(type_chunk_size=80)
-            assert tp._input_provider is None, (
+            assert _st._input_provider is None, (
                 "configure(type_chunk_size=...) should invalidate "
                 "_input_provider"
             )
         finally:
-            tp._input_provider = saved
+            _st._input_provider = saved
 
 
 # -----------------------------------------------------------------------

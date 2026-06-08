@@ -1,7 +1,7 @@
 """Tests for screenshot functionality.
 
 Covers tp.screenshot(), tp.monitor_count(), the internal
-_find_window() helper, and the low-level utilities
+find_window() helper, and the low-level utilities
 take_screenshot() / get_monitor_regions().
 
 Desktop and monitor tests require a running display server and
@@ -16,8 +16,11 @@ from __future__ import annotations
 import pytest
 
 import touchpoint as tp
+from touchpoint.core.element import Element
+from touchpoint.core.types import Role
 from touchpoint.utils.screenshot import get_monitor_regions, take_screenshot
 from tests.conftest import (
+    bogus_element_id,
     skip_without_backend,
 )
 
@@ -225,6 +228,37 @@ class TestScreenshotValidation:
         with pytest.raises(ValueError, match="at most one scope parameter"):
             tp.screenshot(element="fake:1", app="Firefox")
 
+    def test_padding_preserves_negative_virtual_desktop_coordinates(
+        self, monkeypatch,
+    ):
+        """Padding must not clip valid coordinates on left or upper monitors."""
+        captured_regions = []
+        image = object()
+        element = Element(
+            id="ax:1:test:0",
+            name="Offscreen",
+            role=Role.BUTTON,
+            states=[],
+            position=(30, 30),
+            size=(100, 80),
+            app="Test",
+            pid=1,
+            backend="ax",
+            raw_role="AXButton",
+        )
+
+        def fake_take_screenshot(*, region=None):
+            captured_regions.append(region)
+            return image
+
+        monkeypatch.setattr(
+            "touchpoint.utils.screenshot.take_screenshot",
+            fake_take_screenshot,
+        )
+
+        assert tp.screenshot(element=element, padding=20) is image
+        assert captured_regions == [(-40, -30, 100, 90)]
+
 
 @pytest.mark.integration
 class TestScreenshotValidationMonitor:
@@ -256,15 +290,15 @@ class TestScreenshotValidationBackend:
         with pytest.raises(ValueError, match="not found"):
             tp.screenshot(window_id="nonexistent:999:999")
 
-    def test_nonexistent_element_string_raises(self):
-        """A nonexistent element id string raises ValueError."""
-        with pytest.raises(ValueError, match="not found"):
+    def test_malformed_element_string_raises(self):
+        """A malformed element id string raises ValueError."""
+        with pytest.raises(ValueError, match="[Mm]alformed"):
             tp.screenshot(element="nonexistent:999:999")
 
     def test_nonexistent_element_id_raises(self):
         """A well-formed but nonexistent element id raises ValueError."""
         with pytest.raises(ValueError, match="not found"):
-            tp.screenshot(element="atspi:999:999:0.0.0")
+            tp.screenshot(element=bogus_element_id())
 
 
 # -----------------------------------------------------------------------
@@ -315,17 +349,17 @@ class TestGetMonitorRegions:
 
 
 # -----------------------------------------------------------------------
-# _find_window() (internal helper)
+# find_window() helper
 # -----------------------------------------------------------------------
 
 @pytest.mark.integration
 @skip_without_backend
 class TestFindWindow:
-    """tp._find_window() internal helper tests."""
+    """tp.find_window() public helper tests."""
 
     def test_by_app_returns_window(self, any_app):
-        """_find_window(app=...) returns a Window for a running app."""
-        win = tp._find_window(app=any_app)
+        """find_window(app=...) returns a Window for a running app."""
+        win = tp.find_window(app=any_app)
         assert win is not None
         assert win.app.lower() == any_app.lower()
 
@@ -333,14 +367,20 @@ class TestFindWindow:
 @pytest.mark.integration
 @skip_without_backend
 class TestFindWindowEdgeCases:
-    """_find_window() edge cases."""
+    """find_window() edge cases."""
 
     def test_by_app_nonexistent_returns_none(self):
         """A nonexistent app returns None."""
-        result = tp._find_window(app="nonexistent_app_xyz_999")
+        result = tp.find_window(app="nonexistent_app_xyz_999")
         assert result is None
 
     def test_by_window_id_nonexistent_returns_none(self):
         """A nonexistent window id returns None."""
-        result = tp._find_window(window_id="nonexistent:999:999")
+        result = tp.find_window(window_id="nonexistent:999:999")
         assert result is None
+
+
+@pytest.mark.unit
+class TestFindWindowCompatibility:
+    def test_private_alias_is_retained(self):
+        assert tp._find_window is tp.find_window

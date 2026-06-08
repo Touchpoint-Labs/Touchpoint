@@ -342,8 +342,8 @@ class TestActivateWindowValidation:
     """tp.activate_window() validation tests (not destructive)."""
 
     def test_activate_window_invalid_id(self):
-        """A nonexistent window id raises ValueError."""
-        with pytest.raises(ValueError, match="no window found"):
+        """Malformed window ids raise ActionFailedError."""
+        with pytest.raises(ActionFailedError, match="malformed window_id"):
             tp.activate_window("nonexistent:999:999")
 
 
@@ -387,8 +387,24 @@ class TestSetNumericValueValidation:
 
     def test_set_numeric_value_no_value_interface(self, backend):
         """An element without Value interface raises ActionFailedError."""
-        # Find any button — buttons don't have a Value interface.
-        elems = tp.elements(role=Role.BUTTON, named_only=True)
+        # Find any button in a visible window.  On macOS, scanning every
+        # app can block on a slow AX client, so keep this validation scoped.
+        elems = []
+        for win in tp.windows():
+            if not win.is_visible:
+                continue
+            try:
+                elems = tp.elements(
+                    window_id=win.id,
+                    role=Role.BUTTON,
+                    named_only=True,
+                    max_elements=50,
+                    max_depth=8,
+                )
+            except Exception:
+                continue
+            if elems:
+                break
         if not elems:
             pytest.skip("no buttons found to test")
         with pytest.raises(ActionFailedError):

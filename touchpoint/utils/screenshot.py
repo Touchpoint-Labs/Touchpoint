@@ -6,7 +6,7 @@ Supports full-screen capture, window/element cropping, and padding.
 No encoding, no base64, no "send to LLM" helpers — the agent
 developer decides what to do with the image.
 
-Depends on ``Pillow`` (installed automatically with ``pip install touchpoint-py``).
+Depends on ``Pillow`` (installed automatically with ``pip install touchpoint``).
 
 Platform support:
 

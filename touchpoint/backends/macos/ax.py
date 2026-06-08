@@ -9,7 +9,7 @@ only expose a few elements via the AX API should use the CDP backend
 instead.
 
 Requires:
-    - Python packages (installed automatically with ``pip install touchpoint-py``):
+    - Python packages (installed automatically with ``pip install touchpoint``):
         - ``pyobjc-framework-ApplicationServices``
           (transitively pulls in ``pyobjc-framework-Quartz`` and
           ``pyobjc-framework-Cocoa``)
@@ -34,7 +34,13 @@ import sys
 import uuid
 from typing import Any
 
-from touchpoint.backends.base import Backend
+from touchpoint.backends.base import (
+    Backend,
+    make_element_not_found_error,
+    make_malformed_element_id_error,
+    make_malformed_window_id_error,
+    make_window_not_found_error,
+)
 from touchpoint.core.element import Element
 from touchpoint.core.exceptions import ActionFailedError
 from touchpoint.core.types import Role, State
@@ -96,6 +102,7 @@ _AX_ROLE_MAP: dict[str, Role] = {
 
     # Tables
     "AXTable": Role.TABLE,
+    "AXGrid": Role.GRID,
     "AXCell": Role.TABLE_CELL,
     "AXColumn": Role.TABLE_COLUMN_HEADER,
     "AXSortButton": Role.BUTTON,
@@ -109,6 +116,7 @@ _AX_ROLE_MAP: dict[str, Role] = {
     "AXSlider": Role.SLIDER,
     "AXScrollBar": Role.SCROLL_BAR,
     "AXProgressIndicator": Role.PROGRESS_BAR,
+    "AXBusyIndicator": Role.PROGRESS_BAR,
     "AXValueIndicator": Role.SLIDER,
     "AXRelevanceIndicator": Role.PROGRESS_BAR,
     "AXLevelIndicator": Role.PROGRESS_BAR,
@@ -155,6 +163,8 @@ _AX_ROLE_MAP: dict[str, Role] = {
     "AXArticle": Role.ARTICLE,
     "AXDocumentWeb": Role.DOCUMENT,
     "AXDocumentArticle": Role.ARTICLE,
+    # PDF / multi-page document pages (macOS 10.13+)
+    "AXPage": Role.SECTION,
 
     # Title bar
     "AXTitleBar": Role.TITLE_BAR,
@@ -168,6 +178,9 @@ _AX_ROLE_MAP: dict[str, Role] = {
 
     # Disclosure
     "AXDisclosureRow": Role.TREE_ITEM,
+
+    # Frame (rare — some toolkits expose this)
+    "AXFrame": Role.FRAME,
 }
 
 
@@ -201,6 +214,26 @@ _AX_SUBROLE_MAP: dict[str, Role] = {
     "AXDescriptionList": Role.LIST,
     "AXTextAttachment": Role.IMAGE,
     "AXSectionListItem": Role.LIST_ITEM,
+
+    # Subrole refinements for parity with CDP / AT-SPI2
+    "AXLabel": Role.LABEL,
+    "AXParagraph": Role.PARAGRAPH,
+    "AXFormRole": Role.FORM,
+    "AXLandmarkForm": Role.FORM,
+    "AXFigure": Role.FIGURE,
+    "AXNote": Role.NOTE,
+    "AXMeter": Role.METER,
+    "AXCheckMenuItem": Role.CHECK_MENU_ITEM,
+    "AXRadioMenuItem": Role.RADIO_MENU_ITEM,
+    "AXSplitButton": Role.SPLIT_BUTTON,
+    "AXSectionHeader": Role.HEADER,
+    "AXFooter": Role.FOOTER,
+    # Clickable text inside AXStaticText (Cocoa/SwiftUI links)
+    "AXTextLink": Role.LINK,
+    # Media scrubber (AVPlayer, media UIs) — macOS 10.5+
+    "AXTimeline": Role.SLIDER,
+    # Star rating control (App Store, Music, Photos) — macOS 10.6+
+    "AXRatingIndicator": Role.SLIDER,
 }
 
 
@@ -208,7 +241,20 @@ _AX_SUBROLE_MAP: dict[str, Role] = {
 # Window roles / subroles that represent top-level OS windows
 # ---------------------------------------------------------------------------
 
-_WINDOW_ROLES: set[str] = {"AXWindow", "AXSheet", "AXDialog"}
+_WINDOW_ROLES: set[str] = {
+    "AXWindow",
+    "AXSheet",
+    "AXDialog",
+    "AXPopover",    # NSPopover (Calendar event editor, Photos info, etc.)
+}
+
+# Unified roles that imply CLICKABLE state (mirrors the UIA backend's
+# _CLICKABLE_ROLES so cross-platform behaviour is consistent).
+_AX_CLICKABLE_ROLES: frozenset[Role] = frozenset({
+    Role.BUTTON, Role.LINK, Role.MENU_ITEM,
+    Role.TOGGLE_BUTTON, Role.SWITCH, Role.SPLIT_BUTTON,
+    Role.COMBO_BOX, Role.TAB,
+})
 
 # Roles whose user-visible text lives in AXValue rather than AXTitle.
 # For these roles, _ax_name() will fall back to AXValue when AXTitle
@@ -245,6 +291,16 @@ def _ax_name(element: Any) -> str:
     return ""
 
 
+def _copy_ax_attr(element: Any, attr: str) -> tuple[int | None, Any]:
+    """Read one AX attribute while preserving the native AX error code."""
+    try:
+        from ApplicationServices import AXUIElementCopyAttributeValue
+
+        return AXUIElementCopyAttributeValue(element, attr, None)
+    except Exception:
+        return None, None
+
+
 def _get_ax_attr(element: Any, attr: str, default: Any = None) -> Any:
     """Safely read an AX attribute from an AXUIElement.
 
@@ -255,18 +311,9 @@ def _get_ax_attr(element: Any, attr: str, default: Any = None) -> Any:
     Returns *default* if the attribute is missing, not supported,
     or the element is stale.
     """
-    try:
-        from ApplicationServices import (
-            AXUIElementCopyAttributeValue,
-        )
-
-        err, value = AXUIElementCopyAttributeValue(
-            element, attr, None,
-        )
-        if err == 0 and value is not None:
-            return value
-    except Exception:
-        pass
+    err, value = _copy_ax_attr(element, attr)
+    if err == 0 and value is not None:
+        return value
     return default
 
 
@@ -402,10 +449,16 @@ class AxBackend(Backend):
         "right_click": ["AXShowMenu"],
     }
 
-    def __init__(self) -> None:
+    def __init__(self, *, messaging_timeout: float = 1.0) -> None:
         self._available: bool = False
         self._ax_module: Any = None  # ApplicationServices module
+        self._messaging_timeout = float(messaging_timeout)
+        self._unresponsive_pids: set[int] = set()
+        self._skipped_apps: dict[int, dict[str, Any]] = {}
+        self._timeout_apply_failures: set[int] = set()
         self._acc_refs: dict[str, Any] = {}   # element_id → AXUIElement
+        # Window IDs seen by this backend; (pid, token) -> AXUIElement.
+        self._window_refs: dict[tuple[int, str], Any] = {}
         self._hit_refs: dict[str, Any] = {}   # hit_id → AXUIElement
         self._hit_order: list[str] = []
         self._max_hit_refs: int = 256
@@ -441,6 +494,88 @@ class AxBackend(Backend):
             permission is granted in System Settings.
         """
         return self._available
+
+    def set_messaging_timeout(self, timeout: float) -> None:
+        """Apply a new timeout to AX application references created later."""
+        self._messaging_timeout = float(timeout)
+        # Cached descendants may retain the messaging policy from an older
+        # application reference. Re-resolve them on the next operation.
+        self._acc_refs.clear()
+        self._window_refs.clear()
+        self._hit_refs.clear()
+        self._hit_order.clear()
+
+    def get_diagnostics(self) -> dict[str, Any]:
+        """Return recent AX responsiveness data for ``tp.diagnostics()``."""
+        return {
+            "messaging_timeout_seconds": self._messaging_timeout,
+            "skipped_apps": [
+                self._skipped_apps[pid] for pid in sorted(self._skipped_apps)
+            ],
+            "timeout_apply_failures": sorted(self._timeout_apply_failures),
+        }
+
+    def _begin_ax_request(self) -> None:
+        """Allow previously unresponsive apps to be retried by a new request."""
+        self._unresponsive_pids.clear()
+
+    def _create_application_element(self, pid: int) -> Any:
+        """Create an AX app reference with a bounded messaging timeout."""
+        from ApplicationServices import AXUIElementCreateApplication
+
+        ax_app = AXUIElementCreateApplication(pid)
+        self._timeout_apply_failures.discard(pid)
+        self._prepare_ax_element(ax_app, pid)
+        return ax_app
+
+    def _prepare_ax_element(self, ax_el: Any, pid: int | None = None) -> Any:
+        """Apply the timeout to an AX reference before messaging through it."""
+        try:
+            from ApplicationServices import AXUIElementSetMessagingTimeout
+
+            err = AXUIElementSetMessagingTimeout(
+                ax_el, self._messaging_timeout,
+            )
+            if err != 0 and pid is not None:
+                self._timeout_apply_failures.add(pid)
+        except Exception:
+            # Older bridges may not expose the setter even though the AX API
+            # itself is available. Keep operating and surface the PID when
+            # the reference belongs to a concrete application.
+            if pid is not None:
+                self._timeout_apply_failures.add(pid)
+        return ax_el
+
+    def _get_application_attr(
+        self,
+        pid: int,
+        ax_app: Any,
+        attr: str,
+        default: Any = None,
+        *,
+        app_name: str = "",
+    ) -> Any:
+        """Read an app-level attribute and skip timed-out apps for this request."""
+        err, value = _copy_ax_attr(ax_app, attr)
+        try:
+            from ApplicationServices import kAXErrorCannotComplete
+        except ImportError:
+            kAXErrorCannotComplete = None
+
+        if kAXErrorCannotComplete is not None and err == kAXErrorCannotComplete:
+            self._unresponsive_pids.add(pid)
+            self._skipped_apps[pid] = {
+                "pid": pid,
+                "app": app_name,
+                "reason": "kAXErrorCannotComplete",
+                "attribute": attr,
+            }
+            return default
+        if err == 0:
+            self._skipped_apps.pop(pid, None)
+            if value is not None:
+                return value
+        return default
 
     # -- Backend ABC: routing methods -------------------------------------
 
@@ -531,6 +666,7 @@ class AxBackend(Backend):
         """
         if not self._available:
             return []
+        self._begin_ax_request()
 
         try:
             from AppKit import (
@@ -588,11 +724,11 @@ class AxBackend(Backend):
                         # Lightweight probe: only AXExtrasMenuBar
                         # (avoids slow AX calls to background daemons).
                         try:
-                            from ApplicationServices import (
-                                AXUIElementCreateApplication,
-                            )
-                            ax_app = AXUIElementCreateApplication(pid)
-                            if _get_ax_attr(ax_app, "AXExtrasMenuBar") is None:
+                            ax_app = self._create_application_element(pid)
+                            if self._get_application_attr(
+                                pid, ax_app, "AXExtrasMenuBar",
+                                app_name=name,
+                            ) is None:
                                 continue
                         except Exception:
                             continue
@@ -612,6 +748,7 @@ class AxBackend(Backend):
         """
         if not self._available:
             return []
+        self._begin_ax_request()
 
         try:
             from AppKit import (
@@ -619,7 +756,6 @@ class AxBackend(Backend):
                 NSApplicationActivationPolicyRegular,
                 NSApplicationActivationPolicyAccessory,
             )
-            from ApplicationServices import AXUIElementCreateApplication
         except ImportError:
             return []
 
@@ -673,16 +809,23 @@ class AxBackend(Backend):
             ):
                 continue
 
-            ax_app = AXUIElementCreateApplication(pid)
-            ax_windows = _get_ax_attr(ax_app, "AXWindows")
+            ax_app = self._create_application_element(pid)
+            ax_windows = self._get_application_attr(
+                pid, ax_app, "AXWindows", app_name=app_name,
+            )
             if not ax_windows:
                 continue
 
             is_frontmost_app = pid == frontmost_pid
+            seen_tokens: dict[str, int] = {}
 
             for win_idx, ax_win in enumerate(ax_windows):
-                title = _get_ax_attr(ax_win, "AXTitle", "")
+                self._prepare_ax_element(ax_win, pid)
                 role = _get_ax_attr(ax_win, "AXRole", "")
+                if role not in _WINDOW_ROLES:
+                    continue
+
+                title = _get_ax_attr(ax_win, "AXTitle", "")
 
                 # Position and size.
                 pos = _ax_position(ax_win)
@@ -700,7 +843,11 @@ class AxBackend(Backend):
                 )
                 is_visible = not is_minimized and size[0] > 0 and size[1] > 0
 
-                win_token = self._window_token(ax_win, fallback_index=win_idx)
+                win_token = self._unique_window_token(
+                    self._window_token(ax_win, fallback_index=win_idx),
+                    seen_tokens,
+                )
+                self._remember_window(pid, win_token, ax_win)
                 win_id = f"ax:{pid}:{win_token}"
 
                 # Raw: extra AX-specific data.
@@ -780,6 +927,7 @@ class AxBackend(Backend):
             return []
 
         # Reset per-call state.
+        self._begin_ax_request()
         self._element_count = 0
         self._max_elements = (
             max_elements if max_elements is not None else sys.maxsize
@@ -814,6 +962,7 @@ class AxBackend(Backend):
             for i, child in enumerate(children):
                 if self._element_count >= self._max_elements:
                     break
+                self._prepare_ax_element(child, pid)
                 eid = f"{root_element}.{i}"
                 if tree:
                     elements.append(
@@ -855,10 +1004,12 @@ class AxBackend(Backend):
         elements = []
 
         for ax_win, app_name, pid, win_id in roots:
+            self._prepare_ax_element(ax_win, pid)
             children = _get_ax_attr(ax_win, "AXChildren") or []
             for i, child in enumerate(children):
                 if self._element_count >= self._max_elements:
                     break
+                self._prepare_ax_element(child, pid)
                 eid = f"{win_id}:{i}"
                 if tree:
                     elements.append(
@@ -920,6 +1071,7 @@ class AxBackend(Backend):
             )
 
             system = AXUIElementCreateSystemWide()
+            self._prepare_ax_element(system)
             err, hit_element = AXUIElementCopyElementAtPosition(
                 system, float(x), float(y), None,
             )
@@ -938,6 +1090,7 @@ class AxBackend(Backend):
             # layout changes.
             hit_token = uuid.uuid4().hex[:12]
             element_id = f"ax:{pid}:hit:{hit_token}"
+            self._prepare_ax_element(hit_element, pid)
             self._cache_hit_element(element_id, hit_element)
             return self._build_element(
                 hit_element, app_name, pid, element_id,
@@ -957,13 +1110,24 @@ class AxBackend(Backend):
 
         Returns:
             The :class:`Element` if found, ``None`` otherwise.
+
+        Raises:
+            ValueError: If *element_id* is structurally malformed.
         """
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "ax":
+            raise ValueError(f"Malformed element ID: {element_id!r}")
+        try:
+            pid = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed element ID: {element_id!r}",
+            ) from exc
+
         ax_el = self._resolve_element(element_id)
         if ax_el is None:
             return None
 
-        parts = element_id.split(":")
-        pid = int(parts[1])
         app_name = self._get_app_name_for_pid(pid)
 
         # Parent id: everything up to the last '.' in the child path.
@@ -993,13 +1157,7 @@ class AxBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 the action is not supported.
         """
-        ax_el = self._resolve_element(element_id)
-        if ax_el is None:
-            raise ActionFailedError(
-                action=action,
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        ax_el = self._resolve_element_or_raise(element_id, action)
 
         # Attempt the action directly.
         available_actions = _get_ax_actions(ax_el)
@@ -1035,13 +1193,7 @@ class AxBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 does not support value editing.
         """
-        ax_el = self._resolve_element(element_id)
-        if ax_el is None:
-            raise ActionFailedError(
-                action="set_value",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        ax_el = self._resolve_element_or_raise(element_id, "set_value")
 
         # Check if AXValue is settable.
         try:
@@ -1119,13 +1271,9 @@ class AxBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 does not support numeric values.
         """
-        ax_el = self._resolve_element(element_id)
-        if ax_el is None:
-            raise ActionFailedError(
-                action="set_numeric_value",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        ax_el = self._resolve_element_or_raise(
+            element_id, "set_numeric_value",
+        )
 
         # Check if AXValue is settable.
         try:
@@ -1167,6 +1315,128 @@ class AxBackend(Backend):
             reason="failed to set AXValue",
         )
 
+    def get_text_content(self, element_id: str) -> str | None:
+        """Return the full text content of an element via macOS AX.
+
+        Raises:
+            ValueError: If *element_id* is structurally malformed.
+        """
+        # Structural validation up front so malformed IDs raise per the
+        # ABC contract.  ``_resolve_element`` swallows ValueError from
+        # the internal ``int(parts[1])`` parse, which would otherwise
+        # silently conflate malformed input with "not found".
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "ax":
+            raise ValueError(f"Malformed element ID: {element_id!r}")
+        try:
+            int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed element ID: {element_id!r}",
+            ) from exc
+
+        ax_el = self._resolve_element(element_id)
+        if ax_el is None:
+            return None
+        val = _get_ax_attr(ax_el, "AXValue")
+        if val is not None:
+            return str(val)
+        # Some elements (e.g. AXStaticText) use AXTitle instead.
+        title = _get_ax_attr(ax_el, "AXTitle")
+        if title is not None:
+            return str(title)
+        return None
+
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within an element via macOS AX.
+
+        Uses ``AXSelectedTextRange`` which takes a CFRange value.
+
+        Args:
+            element_id: The target element's id.
+            start: Start character offset (0-based, inclusive).
+            end: End character offset (0-based, exclusive).
+
+        Returns:
+            ``True`` if the selection was applied.
+
+        Raises:
+            ActionFailedError: If the element cannot be found or
+                does not support text selection.
+        """
+        ax_el = self._resolve_element_or_raise(element_id, "select_text")
+
+        if start < 0 or end < start:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="invalid text range",
+            )
+
+        content = _get_ax_attr(ax_el, "AXValue")
+        if content is not None and end > len(str(content)):
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="text range is out of bounds",
+            )
+
+        try:
+            from ApplicationServices import (
+                AXUIElementIsAttributeSettable,
+            )
+            err, settable = AXUIElementIsAttributeSettable(
+                ax_el, "AXSelectedTextRange", None,
+            )
+            if err != 0 or not settable:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="element does not support AXSelectedTextRange",
+                )
+        except ActionFailedError:
+            raise
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=str(exc),
+            ) from exc
+
+        try:
+            from CoreFoundation import CFRangeMake
+            from ApplicationServices import (
+                AXValueCreate,
+                kAXValueCFRangeType,
+            )
+
+            length = end - start
+            cf_range = CFRangeMake(start, length)
+            ax_range = AXValueCreate(kAXValueCFRangeType, cf_range)
+            if ax_range is None:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="failed to create AXSelectedTextRange value",
+                )
+            if _set_ax_attr(ax_el, "AXSelectedTextRange", ax_range):
+                return True
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="failed to set AXSelectedTextRange",
+            )
+        except ActionFailedError:
+            raise
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=str(exc),
+            ) from exc
+
     def focus_element(self, element_id: str) -> bool:
         """Move keyboard focus to an element via macOS AX.
 
@@ -1183,13 +1453,7 @@ class AxBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 cannot receive focus.
         """
-        ax_el = self._resolve_element(element_id)
-        if ax_el is None:
-            raise ActionFailedError(
-                action="focus",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        ax_el = self._resolve_element_or_raise(element_id, "focus")
 
         # Primary: set AXFocused.
         focused = _set_ax_attr(ax_el, "AXFocused", True)
@@ -1214,19 +1478,6 @@ class AxBackend(Backend):
                    "and has no focus action",
         )
 
-    def select_text(
-        self, element_id: str, start: int, end: int,
-    ) -> bool:
-        """Select a range of text within an element via macOS AX.
-
-        TODO: Implement using settable ``AXSelectedTextRange``.
-        """
-        raise ActionFailedError(
-            action="select_text",
-            element_id=element_id,
-            reason="select_text not yet implemented for macOS AX backend",
-        )
-
     def activate_window(self, window_id: str) -> bool:
         """Bring a window to the foreground via macOS AX.
 
@@ -1240,19 +1491,17 @@ class AxBackend(Backend):
         Returns:
             ``True`` if the window was activated.
         """
-        parts = window_id.split(":")
-        if len(parts) < 3 or parts[0] != "ax":
-            return False
+        ax_win = self._resolve_ax_window_or_raise(
+            window_id, "activate_window",
+        )
+        # We need the pid for the NSWorkspace activation step; the
+        # resolver already validated the id, so a re-split is safe.
+        pid = int(window_id.split(":")[1])
 
-        try:
-            pid = int(parts[1])
-        except ValueError:
-            return False
-
-        win_token = parts[2]
-        ax_win = self._get_window_element(pid, win_token)
-        if ax_win is None:
-            return False
+        # Un-minimize first if needed — AXRaise alone won't pull
+        # a window out of the dock.
+        if _get_ax_attr(ax_win, "AXMinimized"):
+            _set_ax_attr(ax_win, "AXMinimized", False)
 
         # Raise the window.
         _perform_ax_action(ax_win, "AXRaise")
@@ -1271,6 +1520,108 @@ class AxBackend(Backend):
             pass
 
         return True  # Window was raised even if app activation failed.
+
+    def _resolve_ax_window(self, window_id: str) -> Any | None:
+        """Parse a window ID and return its AXUIElement, or ``None``."""
+        parts = window_id.split(":")
+        if len(parts) < 3 or parts[0] != "ax":
+            return None
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            return None
+        return self._get_window_element(pid, parts[2])
+
+    def _resolve_ax_window_or_raise(
+        self, window_id: str, action: str,
+    ) -> Any:
+        """Validate + look up.  Raises ActionFailedError on either failure.
+
+        Separates the three failure types:
+            - malformed window_id  → ActionFailedError ("malformed ...")
+            - well-formed but no window → ActionFailedError ("not found")
+            - operational failure of the op itself → caller returns False
+
+        Window IDs are exactly three parts; the four-part element form
+        (``ax:<pid>:<window_token>:<child_path>``) is rejected here so
+        it can't accidentally be operated on as a window.
+        """
+        parts = window_id.split(":")
+        if len(parts) != 3 or parts[0] != "ax":
+            raise make_malformed_window_id_error(
+                action, window_id, "ax:<pid>:<window_token>",
+            )
+        try:
+            pid = int(parts[1])
+        except ValueError as exc:
+            raise make_malformed_window_id_error(
+                action, window_id, "ax:<pid>:<window_token>",
+            ) from exc
+        ax_win = self._get_window_element(pid, parts[2])
+        if ax_win is None:
+            raise make_window_not_found_error(action, window_id)
+        return ax_win
+
+    def minimize_window(self, window_id: str) -> bool:
+        """Minimize a window via macOS AX."""
+        ax_win = self._resolve_ax_window_or_raise(window_id, "minimize_window")
+        return _set_ax_attr(ax_win, "AXMinimized", True)
+
+    def fullscreen_window(
+        self, window_id: str, fullscreen: bool = True,
+    ) -> bool:
+        """Enter or exit fullscreen via macOS AX."""
+        ax_win = self._resolve_ax_window_or_raise(
+            window_id, "fullscreen_window",
+        )
+        return _set_ax_attr(ax_win, "AXFullScreen", fullscreen)
+
+    def close_window(self, window_id: str) -> bool:
+        """Close a window by pressing its close button via macOS AX."""
+        ax_win = self._resolve_ax_window_or_raise(window_id, "close_window")
+        close_btn = _get_ax_attr(ax_win, "AXCloseButton")
+        if close_btn is None:
+            return False
+        pid = int(window_id.split(":")[1])
+        self._prepare_ax_element(close_btn, pid)
+        return _perform_ax_action(close_btn, "AXPress")
+
+    def move_window(self, window_id: str, x: int, y: int) -> bool:
+        """Move a window to (x, y) via macOS AX."""
+        ax_win = self._resolve_ax_window_or_raise(window_id, "move_window")
+        try:
+            from ApplicationServices import AXValueCreate, kAXValueCGPointType
+
+            ax_point = AXValueCreate(
+                kAXValueCGPointType, (float(x), float(y)),
+            )
+            return _set_ax_attr(ax_win, "AXPosition", ax_point)
+        except Exception:
+            return False
+
+    def resize_window(
+        self, window_id: str, width: int, height: int,
+    ) -> bool:
+        """Resize a window to (width, height) via macOS AX."""
+        if width <= 0 or height <= 0:
+            raise ActionFailedError(
+                action="resize_window",
+                element_id=window_id,
+                reason=(
+                    f"width and height must be positive integers, "
+                    f"got width={width}, height={height}"
+                ),
+            )
+        ax_win = self._resolve_ax_window_or_raise(window_id, "resize_window")
+        try:
+            from ApplicationServices import AXValueCreate, kAXValueCGSizeType
+
+            ax_size = AXValueCreate(
+                kAXValueCGSizeType, (float(width), float(height)),
+            )
+            return _set_ax_attr(ax_win, "AXSize", ax_size)
+        except Exception:
+            return False
 
     # -- Inflate ----------------------------------------------------------
 
@@ -1341,7 +1692,6 @@ class AxBackend(Backend):
                 NSApplicationActivationPolicyRegular,
                 NSApplicationActivationPolicyAccessory,
             )
-            from ApplicationServices import AXUIElementCreateApplication
         except ImportError:
             return roots
 
@@ -1396,31 +1746,55 @@ class AxBackend(Backend):
                 policy == NSApplicationActivationPolicyAccessory
                 and pid not in pids_with_windows
             ):
-                ax_app = AXUIElementCreateApplication(pid)
-                ax_extras = _get_ax_attr(ax_app, "AXExtrasMenuBar")
+                ax_app = self._create_application_element(pid)
+                ax_extras = self._get_application_attr(
+                    pid, ax_app, "AXExtrasMenuBar", app_name=name,
+                )
                 if ax_extras is not None:
                     ex_id = f"ax:{pid}:extras"
                     roots.append((ax_extras, name, pid, ex_id))
                 continue
 
-            ax_app = AXUIElementCreateApplication(pid)
-            ax_windows = _get_ax_attr(ax_app, "AXWindows") or []
+            ax_app = self._create_application_element(pid)
+            ax_windows = self._get_application_attr(
+                pid, ax_app, "AXWindows", app_name=name,
+            ) or []
+            if pid in self._unresponsive_pids:
+                continue
+            seen_tokens: dict[str, int] = {}
 
             for win_idx, ax_win in enumerate(ax_windows):
-                win_token = self._window_token(ax_win, fallback_index=win_idx)
+                self._prepare_ax_element(ax_win, pid)
+                role = _get_ax_attr(ax_win, "AXRole", "")
+                if role not in _WINDOW_ROLES:
+                    continue
+
+                win_token = self._unique_window_token(
+                    self._window_token(ax_win, fallback_index=win_idx),
+                    seen_tokens,
+                )
+                self._remember_window(pid, win_token, ax_win)
                 win_id = f"ax:{pid}:{win_token}"
                 roots.append((ax_win, name, pid, win_id))
 
             # Include the application menu bar as a root so that
             # menu items are discoverable via find() / elements().
-            ax_menubar = _get_ax_attr(ax_app, "AXMenuBar")
+            ax_menubar = self._get_application_attr(
+                pid, ax_app, "AXMenuBar", app_name=name,
+            )
+            if pid in self._unresponsive_pids:
+                continue
             if ax_menubar is not None:
                 mb_id = f"ax:{pid}:menubar"
                 roots.append((ax_menubar, name, pid, mb_id))
 
             # Include the extras menu bar (status-bar icons) for
             # processes like ControlCenter and SystemUIServer.
-            ax_extras = _get_ax_attr(ax_app, "AXExtrasMenuBar")
+            ax_extras = self._get_application_attr(
+                pid, ax_app, "AXExtrasMenuBar", app_name=name,
+            )
+            if pid in self._unresponsive_pids:
+                continue
             if ax_extras is not None:
                 ex_id = f"ax:{pid}:extras"
                 roots.append((ax_extras, name, pid, ex_id))
@@ -1429,10 +1803,13 @@ class AxBackend(Backend):
             # element with role AXMenu, not inside AXWindows.
             # Also, apps with no windows but direct UI children
             # (e.g. the Dock's AXList) need their children as roots.
-            ax_children = _get_ax_attr(ax_app, "AXChildren") or []
+            ax_children = self._get_application_attr(
+                pid, ax_app, "AXChildren", app_name=name,
+            ) or []
             popup_count = 0
             app_child_count = 0
             for child in ax_children:
+                self._prepare_ax_element(child, pid)
                 child_role = _get_ax_attr(child, "AXRole", "")
                 if child_role == "AXMenu":
                     popup_id = f"ax:{pid}:popup{popup_count}"
@@ -1457,19 +1834,54 @@ class AxBackend(Backend):
         Returns:
             The AXUIElement for the window, or ``None``.
         """
-        try:
-            from ApplicationServices import AXUIElementCreateApplication
+        cached = self._window_refs.get((pid, win_token))
+        if cached is not None:
+            self._prepare_ax_element(cached, pid)
+            role = _get_ax_attr(cached, "AXRole", "")
+            if role in _WINDOW_ROLES:
+                return cached
+            self._window_refs.pop((pid, win_token), None)
 
-            ax_app = AXUIElementCreateApplication(pid)
-            ax_windows = _get_ax_attr(ax_app, "AXWindows") or []
+        try:
+            ax_app = self._create_application_element(pid)
+            ax_windows = self._get_application_attr(
+                pid, ax_app, "AXWindows",
+                app_name=self._get_app_name_for_pid(pid),
+            ) or []
+            seen_tokens: dict[str, int] = {}
 
             for idx, ax_win in enumerate(ax_windows):
-                token = self._window_token(ax_win, fallback_index=idx)
+                self._prepare_ax_element(ax_win, pid)
+                role = _get_ax_attr(ax_win, "AXRole", "")
+                if role not in _WINDOW_ROLES:
+                    continue
+
+                token = self._unique_window_token(
+                    self._window_token(ax_win, fallback_index=idx),
+                    seen_tokens,
+                )
                 if token == win_token:
+                    self._remember_window(pid, token, ax_win)
                     return ax_win
         except Exception:
             pass
         return None
+
+    def _remember_window(self, pid: int, win_token: str, ax_win: Any) -> None:
+        """Remember a window token so it survives mutable AX attributes."""
+        self._window_refs[(pid, win_token)] = ax_win
+
+    @staticmethod
+    def _unique_window_token(
+        win_token: str,
+        seen_tokens: dict[str, int],
+    ) -> str:
+        """Disambiguate duplicate AX window tokens within one process."""
+        count = seen_tokens.get(win_token, 0)
+        seen_tokens[win_token] = count + 1
+        if count == 0:
+            return win_token
+        return f"{win_token}.{count}"
 
     @staticmethod
     def _window_token(ax_win: Any, fallback_index: int | None = None) -> str:
@@ -1478,7 +1890,7 @@ class AxBackend(Backend):
         Priority:
             1) ``AXWindowNumber`` when present (most stable)
             2) ``AXIdentifier`` when present
-            3) Fingerprint from title/subrole/geometry
+            3) Fingerprint from window order
         """
         win_num = _get_ax_attr(ax_win, "AXWindowNumber")
         try:
@@ -1492,18 +1904,8 @@ class AxBackend(Backend):
             digest = hashlib.sha1(str(identifier).encode("utf-8")).hexdigest()[:12]
             return f"i{digest}"
 
-        title = str(_get_ax_attr(ax_win, "AXTitle", "") or "")
-        subrole = str(_get_ax_attr(ax_win, "AXSubrole", "") or "")
-        pos = _ax_position(ax_win) or (0.0, 0.0)
-        size = _ax_size(ax_win) or (0.0, 0.0)
-        sig = (
-            f"{title}\x1f{subrole}\x1f"
-            f"{round(pos[0])},{round(pos[1])}\x1f"
-            f"{round(size[0])},{round(size[1])}"
-        )
-        digest = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:12]
-        if fallback_index is not None:
-            return f"f{digest}"
+        index = "" if fallback_index is None else str(fallback_index)
+        digest = hashlib.sha1(index.encode("utf-8")).hexdigest()[:12]
         return f"f{digest}"
 
     def _cache_hit_element(self, hit_id: str, ax_el: Any) -> None:
@@ -1513,6 +1915,48 @@ class AxBackend(Backend):
         while len(self._hit_order) > self._max_hit_refs:
             stale = self._hit_order.pop(0)
             self._hit_refs.pop(stale, None)
+
+    def _validate_element_id(self, element_id: str, action: str) -> None:
+        """Check *element_id* has a well-formed AX shape.
+
+        Validates the prefix and PID only.  The third component may be
+        an opaque window_token or one of the synthetic forms
+        (``hit``, ``menubar``, ``extras``, ``popup{N}``, ``app{N}``),
+        all of which are treated as not-found if they don't resolve.
+
+        Raises:
+            ActionFailedError: If the prefix is wrong or the PID is
+                not a valid integer.
+        """
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "ax":
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "ax:<pid>:<window_token>[:<child_path>]",
+            )
+        try:
+            int(parts[1])
+        except ValueError as exc:
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "ax:<pid>:<window_token>[:<child_path>]",
+            ) from exc
+
+    def _resolve_element_or_raise(
+        self, element_id: str, action: str,
+    ) -> Any:
+        """Validate + look up an element.  Raises ActionFailedError on either failure.
+
+        Separates the three failure types:
+            - malformed element_id → ActionFailedError ("malformed ...")
+            - well-formed but no element → ActionFailedError ("not found")
+            - operational failure of the op itself → caller raises with its own reason
+        """
+        self._validate_element_id(element_id, action)
+        el = self._resolve_element(element_id)
+        if el is None:
+            raise make_element_not_found_error(action, element_id)
+        return el
 
     def _resolve_element(self, element_id: str) -> Any | None:
         """Navigate the AX tree to the element at *element_id*.
@@ -1552,13 +1996,12 @@ class AxBackend(Backend):
         # Synthetic menubar / extras-menubar IDs.
         if parts[2] in ("menubar", "extras"):
             try:
-                from ApplicationServices import AXUIElementCreateApplication
-
-                ax_app = AXUIElementCreateApplication(pid)
+                ax_app = self._create_application_element(pid)
                 attr = "AXMenuBar" if parts[2] == "menubar" else "AXExtrasMenuBar"
-                root = _get_ax_attr(ax_app, attr)
+                root = self._get_application_attr(pid, ax_app, attr)
                 if root is None:
                     return None
+                self._prepare_ax_element(root, pid)
                 # 3-part ID → menubar root itself.
                 if len(parts) < 4 or not parts[3]:
                     return root
@@ -1570,9 +2013,10 @@ class AxBackend(Backend):
                     except ValueError:
                         return None
                     children = _get_ax_attr(current, "AXChildren")
-                    if children is None or idx >= len(children):
+                    if children is None or idx < 0 or idx >= len(children):
                         return None
                     current = children[idx]
+                    self._prepare_ax_element(current, pid)
                 return current
             except Exception:
                 pass
@@ -1581,18 +2025,21 @@ class AxBackend(Backend):
         # Popup/context menu IDs (ax:{pid}:popup{N}:{child_path}).
         if parts[2].startswith("popup"):
             try:
-                from ApplicationServices import AXUIElementCreateApplication
-
                 popup_idx = int(parts[2][5:])
-                ax_app = AXUIElementCreateApplication(pid)
-                ax_children = _get_ax_attr(ax_app, "AXChildren") or []
+                ax_app = self._create_application_element(pid)
+                ax_children = self._get_application_attr(
+                    pid, ax_app, "AXChildren",
+                ) or []
+                for child in ax_children:
+                    self._prepare_ax_element(child, pid)
                 menus = [
                     c for c in ax_children
                     if _get_ax_attr(c, "AXRole", "") == "AXMenu"
                 ]
-                if popup_idx >= len(menus):
+                if popup_idx < 0 or popup_idx >= len(menus):
                     return None
                 root = menus[popup_idx]
+                self._prepare_ax_element(root, pid)
                 if len(parts) < 4 or not parts[3]:
                     return root
                 current = root
@@ -1602,9 +2049,10 @@ class AxBackend(Backend):
                     except ValueError:
                         return None
                     children = _get_ax_attr(current, "AXChildren")
-                    if children is None or idx >= len(children):
+                    if children is None or idx < 0 or idx >= len(children):
                         return None
                     current = children[idx]
+                    self._prepare_ax_element(current, pid)
                 return current
             except Exception:
                 pass
@@ -1614,19 +2062,22 @@ class AxBackend(Backend):
         # (ax:{pid}:app{N}:{child_path}).
         if parts[2].startswith("app") and len(parts[2]) > 3:
             try:
-                from ApplicationServices import AXUIElementCreateApplication
-
                 child_idx = int(parts[2][3:])
-                ax_app = AXUIElementCreateApplication(pid)
-                ax_children = _get_ax_attr(ax_app, "AXChildren") or []
+                ax_app = self._create_application_element(pid)
+                ax_children = self._get_application_attr(
+                    pid, ax_app, "AXChildren",
+                ) or []
+                for child in ax_children:
+                    self._prepare_ax_element(child, pid)
                 non_menu = [
                     c for c in ax_children
                     if _get_ax_attr(c, "AXRole", "") not in
                     ("AXMenuBar", "AXMenu")
                 ]
-                if child_idx >= len(non_menu):
+                if child_idx < 0 or child_idx >= len(non_menu):
                     return None
                 root = non_menu[child_idx]
+                self._prepare_ax_element(root, pid)
                 if len(parts) < 4 or not parts[3]:
                     return root
                 current = root
@@ -1636,9 +2087,10 @@ class AxBackend(Backend):
                     except ValueError:
                         return None
                     children = _get_ax_attr(current, "AXChildren")
-                    if children is None or idx >= len(children):
+                    if children is None or idx < 0 or idx >= len(children):
                         return None
                     current = children[idx]
+                    self._prepare_ax_element(current, pid)
                 return current
             except Exception:
                 pass
@@ -1661,9 +2113,10 @@ class AxBackend(Backend):
             except ValueError:
                 return None
             children = _get_ax_attr(current, "AXChildren")
-            if children is None or idx >= len(children):
+            if children is None or idx < 0 or idx >= len(children):
                 return None
             current = children[idx]
+            self._prepare_ax_element(current, pid)
 
         return current
 
@@ -1696,7 +2149,13 @@ class AxBackend(Backend):
         parts = element_id.split(":")
         if len(parts) >= 3:
             win_id = ":".join(parts[:3])
-            self.activate_window(win_id)
+            try:
+                self.activate_window(win_id)
+            except ActionFailedError:
+                # Synthetic roots such as menubars do not have a
+                # corresponding top-level AX window. Focusing the element
+                # already succeeded, so raising its window is best-effort.
+                pass
 
     @staticmethod
     def _translate_role(ax_el: Any) -> tuple[Role, str]:
@@ -1831,13 +2290,53 @@ class AxBackend(Backend):
             if has_popup:
                 states.append(State.HAS_POPUP)
 
-            # CLICKABLE — inferred from role (consistent with CDP).
-            if role in (
-                "AXButton", "AXLink", "AXMenuItem", "AXMenuBarItem",
-                "AXMenuExtra", "AXDisclosureTriangle", "AXPopUpButton",
-                "AXComboBox", "AXMenuButton",
-            ):
+            # PRESSED — toggle buttons / switches whose value is "on".
+            subrole = str(_get_ax_attr(ax_el, "AXSubrole", ""))
+            if subrole in ("AXToggle", "AXSwitch") or role == "AXMenuButton":
+                val = _get_ax_attr(ax_el, "AXValue")
+                if val == 1 or val is True:
+                    states.append(State.PRESSED)
+
+            # ACTIVE — the frontmost / key window.
+            if role == "AXWindow":
+                is_main = _get_ax_attr(ax_el, "AXMain")
+                if is_main:
+                    states.append(State.ACTIVE)
+
+            # MULTISELECTABLE — list / table / outline that allows
+            # multiple selection.
+            if "AXAllowsMultipleSelection" in attr_names:
+                multi = _get_ax_attr(ax_el, "AXAllowsMultipleSelection")
+                if multi:
+                    states.append(State.MULTISELECTABLE)
+
+            # CLICKABLE — inferred from the unified Role (consistent
+            # with UIA and CDP).  Using ``_translate_role`` here means
+            # subroles like ``AXSwitch`` (on AXCheckBox) and
+            # ``AXToggleButton`` (on AXButton) get CLICKABLE through
+            # their refined unified Role, matching the other backends.
+            unified_role, _raw = AxBackend._translate_role(ax_el)
+            if unified_role in _AX_CLICKABLE_ROLES:
                 states.append(State.CLICKABLE)
+
+            # RESIZABLE — window whose AXSize is settable.
+            if role == "AXWindow":
+                try:
+                    from ApplicationServices import (
+                        AXUIElementIsAttributeSettable,
+                    )
+                    err_r, settable_r = AXUIElementIsAttributeSettable(
+                        ax_el, "AXSize", None,
+                    )
+                    if err_r == 0 and settable_r:
+                        states.append(State.RESIZABLE)
+                except Exception:
+                    pass
+
+            # INVALID — form validation state.
+            invalid = _get_ax_attr(ax_el, "AXInvalid")
+            if invalid and str(invalid).lower() not in ("", "false"):
+                states.append(State.INVALID)
 
             # MULTI_LINE / SINGLE_LINE for text controls.
             if role == "AXTextArea":
@@ -1950,6 +2449,7 @@ class AxBackend(Backend):
         for i, child in enumerate(children):
             if self._element_count >= self._max_elements:
                 break
+            self._prepare_ax_element(child, pid)
             child_id = f"{parent_id}.{i}"
             pre = self._check_filter(child)
             if pre is not None:
@@ -2096,6 +2596,7 @@ class AxBackend(Backend):
         for i, child in enumerate(children):
             if self._element_count >= self._max_elements:
                 break
+            self._prepare_ax_element(child, pid)
             child_id = f"{parent_id}.{i}"
             pre = self._check_filter(child)
             if pre is not None:
@@ -2158,6 +2659,7 @@ class AxBackend(Backend):
         for i, child in enumerate(children):
             if self._element_count >= self._max_elements:
                 break
+            self._prepare_ax_element(child, pid)
             child_id = f"{element_id}.{i}"
             element.children.append(
                 self._to_element_tree(

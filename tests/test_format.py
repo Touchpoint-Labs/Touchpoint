@@ -11,7 +11,11 @@ import json
 import pytest
 
 from touchpoint.core.element import Element
-from touchpoint.core.types import Role, State
+from touchpoint.core.types import (
+    Role, State,
+    INTERACTIVE_ROLES, CONTAINER_ROLES, STRUCTURAL_ROLES,
+    _UNCLASSIFIED_ROLES,
+)
 from touchpoint.format.formatter import format_elements
 
 
@@ -278,3 +282,33 @@ class TestInvalidFormat:
     def test_empty_string(self):
         with pytest.raises(ValueError, match="Unknown format"):
             format_elements([], "")
+
+
+# -----------------------------------------------------------------------
+# Role classification coverage
+# -----------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestRoleClassification:
+    """Every Role must be in exactly one classification bucket."""
+
+    def test_full_coverage(self):
+        classified = (
+            INTERACTIVE_ROLES | CONTAINER_ROLES | STRUCTURAL_ROLES | _UNCLASSIFIED_ROLES
+        )
+        missing = set(Role) - classified
+        assert not missing, (
+            f"Roles missing classification (add to a set or _UNCLASSIFIED_ROLES): {missing}"
+        )
+
+    def test_no_overlap(self):
+        sets = [INTERACTIVE_ROLES, CONTAINER_ROLES, STRUCTURAL_ROLES, _UNCLASSIFIED_ROLES]
+        names = ["INTERACTIVE", "CONTAINER", "STRUCTURAL", "UNCLASSIFIED"]
+        for i, a in enumerate(sets):
+            for j, b in enumerate(sets):
+                if i >= j:
+                    continue
+                overlap = a & b
+                assert not overlap, (
+                    f"{names[i]} and {names[j]} share roles: {overlap}"
+                )

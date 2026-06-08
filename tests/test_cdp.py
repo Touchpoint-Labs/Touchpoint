@@ -25,6 +25,7 @@ All tests skip gracefully when ``TOUCHPOINT_CDP_PORT`` is not set.
 from __future__ import annotations
 
 import json
+from unittest import mock
 
 import pytest
 
@@ -40,7 +41,7 @@ from tests.conftest import (
 
 
 # =====================================================================
-#  AX source — element discovery (default source="full", CDP AX via source="ax")
+#  AX source — element discovery (default source="full", CDP AX via source="cdp_ax")
 # =====================================================================
 
 # -----------------------------------------------------------------------
@@ -858,6 +859,23 @@ class TestCdpValidation:
         fake_ax_id = "cdp:9222:target123:ax_node_42"
         with pytest.raises(ValueError, match="DOM-sourced"):
             tp.elements(source="dom", root_element=fake_ax_id)
+
+    def test_cdp_ax_source_name_is_accepted(self, monkeypatch):
+        """The explicit source name avoids confusion with native macOS AX."""
+        cdp = mock.MagicMock()
+        cdp.get_elements.return_value = []
+        monkeypatch.setattr(tp, "_get_cdp", lambda: cdp)
+
+        assert tp.elements(source="cdp_ax") == []
+        cdp.get_elements.assert_called_once()
+
+    def test_ax_source_name_remains_compatibility_alias(self, monkeypatch):
+        cdp = mock.MagicMock()
+        cdp.get_elements.return_value = []
+        monkeypatch.setattr(tp, "_get_cdp", lambda: cdp)
+
+        assert tp.elements(source="ax") == []
+        cdp.get_elements.assert_called_once()
 
 
 # =====================================================================

@@ -6,9 +6,10 @@
 
 ## What Touchpoint Is
 
-- A **Python client library**: `pip install touchpoint-py`
+- A **Python client library**: `pip install touchpoint`
 - Gives agent developers **structured access to desktop UI** (elements, windows, positions, actions) via native accessibility APIs
 - **Tree-first approach**: the accessibility tree is the primary perception method; screenshots are a simple optional utility
+- **No vision model required** — the no-vision MCP mode uses structured text snapshots of the UI so any LLM (including local models without vision) can control the desktop
 - The **library** is unopinionated — it provides primitives, not workflows
 - The **MCP server** is opinionated — its instructions guide agents toward effective patterns (scoping, keyboard-first, verify-after-act)
 
@@ -57,7 +58,7 @@ touchpoint/
 tests/
 ├── conftest.py          ← shared fixtures, platform detection, skip helpers
 ├── test_discovery.py    ← windows() / apps() listing
-├── test_elements.py     ← elements(), get_element(), element_at(), filtering
+├── test_elements.py     ← elements(), get_element(), element_at(), filtering, Windows UIA translation + live gallery regressions
 ├── test_find.py         ← find() matching, fields, formatting
 ├── test_config.py       ← configure() validation & behaviour
 ├── test_actions.py      ← focus, click, set_value (destructive, gated)
@@ -67,6 +68,8 @@ tests/
 ├── test_matcher.py      ← 4-stage matching pipeline
 ├── test_scale.py        ← scale factor detection & configure(scale_factor=...) override
 ├── test_screenshot.py   ← screenshot capture & crop
+├── test_select_text.py  ← select_text / select_text_range (unit + integration)
+├── _test_app.py         ← deterministic native Win32 control gallery (feeds the UIA regressions in test_elements.py)
 └── test_wait.py         ← wait_for() / wait_for_app() / wait_for_window() polling
 ```
 
@@ -151,6 +154,16 @@ Each backend translates its native roles to these.  **73 roles** total — commo
 - HORIZONTAL, VERTICAL, BUSY, INDETERMINATE
 - HAS_POPUP, MULTISELECTABLE, OFFSCREEN, DEFUNCT, VISITED
 
+### Role classification sets
+
+Three frozensets are exported from `touchpoint` for consumers that need to classify roles:
+
+- `INTERACTIVE_ROLES` — elements an agent can act on directly (buttons, text fields, combo boxes, checkboxes, list items, etc.)
+- `CONTAINER_ROLES` — semantic containers that provide context (menus, lists, tables, dialogs, toolbars, headings, etc.)
+- `STRUCTURAL_ROLES` — anonymous layout wrappers (panels, groups, frames) — transparent in snapshot rendering, collapsed unless named
+
+The MCP snapshot renderer uses these sets to decide what gets a line in the tree view.
+
 ---
 
 ## Two-Layer Backend Architecture
@@ -159,7 +172,7 @@ Touchpoint separates accessibility into two distinct layers, each with its own A
 
 ### Layer 1 — Backend (structured accessibility)
 
-The `Backend` ABC handles **element-aware** operations: discovering the UI tree, reading element properties, and performing native accessibility actions. It has **11 abstract methods** and **7 concrete methods** with safe defaults:
+The `Backend` ABC handles **element-aware** operations: discovering the UI tree, reading element properties, and performing native accessibility actions. It has **12 abstract methods** and **12 concrete methods** with safe defaults:
 
 ```python
 class Backend(ABC):
@@ -170,19 +183,25 @@ class Backend(ABC):
     def get_element_at(self, x: int, y: int) -> Element | None: ...
     def get_element_by_id(self, element_id: str) -> Element | None: ...
 
-    # -- Actions (5 abstract) --
+    # -- Actions (6 abstract) --
     def do_action(self, element_id: str, action: str) -> bool: ...
     def set_value(self, element_id: str, value: str, replace: bool) -> bool: ...
     def set_numeric_value(self, element_id: str, value: float) -> bool: ...
     def focus_element(self, element_id: str) -> bool: ...
     def select_text(self, element_id: str, start: int, end: int) -> bool: ...
+    def get_text_content(self, element_id: str) -> str | None: ...
 
     # -- Availability (1 abstract) --
     def is_available(self) -> bool: ...
 
-    # -- Concrete defaults (7 methods) --
+    # -- Concrete defaults (12 methods) --
     def inflate_element(self, element: Element) -> Element: ...
     def activate_window(self, window_id: str) -> bool: ...
+    def minimize_window(self, window_id: str) -> bool: ...
+    def fullscreen_window(self, window_id: str, fullscreen: bool = True) -> bool: ...
+    def close_window(self, window_id: str) -> bool: ...
+    def move_window(self, window_id: str, x: int, y: int) -> bool: ...
+    def resize_window(self, window_id: str, width: int, height: int) -> bool: ...
     def get_owned_pids(self) -> set[int]: ...
     def owns_element(self, element_id: str) -> bool: ...
     def claims_app(self, app_name: str) -> bool: ...
@@ -264,7 +283,7 @@ tp.set_value(element, text)
 | CDP (browser) | `CdpBackend` (WebSocket → CDP) | Internal (`Input.dispatch*Event`) |
 
 Touchpoint holds multiple backends and **merges their results**.
-The platform backend (AT-SPI2 or UIA) always runs.  The CDP backend
+The platform backend (AT-SPI2, UIA, or macOS AX) always runs.  The CDP backend
 runs alongside it when ``websocket-client`` is installed and at least
 one Chromium/Electron app is launched with ``--remote-debugging-port``.
 
@@ -274,6 +293,12 @@ one Chromium/Electron app is launched with ``--remote-debugging-port``.
   Action/lookup functions route to the correct backend by prefix.
 - **`windows()`** merges: platform windows whose PID matches a CDP
   process are replaced by the richer CDP windows.
+- **Window management** (``minimize``/``fullscreen``/``close``/``move``/
+  ``resize``) on a surfaced ``cdp:`` window is routed to the underlying
+  native OS window — resolved by owning PID, since a CDP target is a
+  page/tab, not an OS window. ``activate_window`` is handled by CDP
+  directly (``Target.activateTarget``). These raise only when no native
+  OS window for the target can be found.
 - **`elements()`** merges using document-subtree stripping.  For
   CDP-backed apps (scoped by ``app=``), both CDP and platform backends
   are queried; ``Role.DOCUMENT`` elements and their descendants are
@@ -293,6 +318,18 @@ one Chromium/Electron app is launched with ``--remote-debugging-port``.
   break the fallback focus step, causing xdotool to type into whatever
   Chrome currently has focused — silent data corruption.
 - **`find()`** searches both backends and merges results.
+
+### Concurrency
+
+Every public API call — and every complete MCP tool workflow — is wrapped
+in a re-entrant lock. Backends keep mutable per-walk state (caches, filter
+hints, element counters), so serializing whole operations stops overlapping
+calls from a multi-threaded host from corrupting each other. The lock is
+re-entrant so nested public calls (e.g. ``screenshot(app=...)`` calling
+``windows()``) don't deadlock. Because COM objects are thread-affine, the
+Windows UIA backend additionally keeps a separate UIA session per calling
+thread, so a worker-thread handoff after a serialized call still has valid
+objects.
 
 ---
 
@@ -341,6 +378,8 @@ tp.right_click(element)                → bool   # tries ShowMenu/show_menu, fa
 tp.set_value(element, "hello")         → bool   # insert at cursor, fallback: focus → type
 tp.set_value(element, "new", replace=True) → bool # replace, fallback: focus → select-all → type
 tp.set_numeric_value(element, 75.0)    → bool   # sliders, spinboxes (Value interface, no fallback)
+tp.select_text(element, text, occurrence=1) → bool  # select substring in any text-bearing element, including read-only web content and document bodies
+tp.get_text_content(element)           → str | None  # full text content via native text interface (AT-SPI2 Text, UIA TextPattern, AXValue, CDP innerText)
 tp.focus(element)                      → bool   # grab_focus / SetFocus (native only, no click fallback)
 tp.action(element, "ShowMenu")         → bool   # raw action, no aliases, no fallback
 
@@ -370,7 +409,7 @@ tp.elements(app="Slack", format="tree")    → str   (indented hierarchy)
 
 # --- Source Selection ---
 tp.elements(app="Chrome", source="full")    → list[Element]  (default: merged native UI + web content)
-tp.elements(app="Chrome", source="ax")      → list[Element]  (CDP AX tree only, web content)
+tp.elements(app="Chrome", source="cdp_ax")  → list[Element]  (CDP AX tree only, web content)
 tp.elements(app="Chrome", source="native")  → list[Element]  (platform-native only, e.g. toolbar/tabs)
 tp.elements(app="Chrome", source="dom")     → list[Element]  (DOM walker, web content)
 
@@ -379,11 +418,16 @@ tp.configure(fuzzy_threshold=0.8)      # minimum fuzzy match score (default 0.6)
 tp.configure(fallback_input=False)     # disable xdotool fallback (default True)
 tp.configure(type_chunk_size=50)       # split long text into 50-char chunks (default 40)
 tp.configure(max_elements=5000)        # max elements to collect per call (default 5000)
-tp.configure(max_depth=10)             # default max depth for tree walks (default 10)
+tp.configure(max_depth=20)             # default max depth for tree walks (default 20)
 tp.configure(cdp_ports={"Slack": 9222})  # explicit CDP port mapping (default None = auto-discover)
 tp.configure(cdp_discover=False)       # disable cdp auto discover (default True)
 tp.configure(scale_factor=1.25)        # override DPR scaling (default None = auto-detect)
 tp.configure(cdp_refresh_interval=10)  # seconds between CDP auto-refresh (default 5)
+tp.configure(ax_messaging_timeout=1)   # max seconds to wait for a macOS AX app reply (default 1)
+
+# --- Health / Diagnostics ---
+tp.diagnostics()                       → dict  (backend, input, CDP-target, and dependency health)
+tp.diagnostics(probe=False)            → dict  (current state only, no discovery I/O)
 ```
 
 ### API design decisions:
@@ -401,8 +445,8 @@ tp.configure(cdp_refresh_interval=10)  # seconds between CDP auto-refresh (defau
 - **`wait_for_window(title)`** polls `windows()` until a window with matching title appears (returns `Window`) or disappears with `gone=True` (returns `True`). Raises `TimeoutError`.
 - All action functions accept **`Element | str`** — either an Element object or a bare id string. LLMs can use IDs directly from previous output.
 - Actions prefer native accessibility action first, fall back to coordinate-based input (InputProvider) if native fails and `fallback_input=True`.
-- `configure()` has exactly **9 knobs**: `fuzzy_threshold` (default 0.6), `fallback_input` (default True), `type_chunk_size` (default 40, splits long text into chunks for xdotool), `max_elements` (default 5000), `max_depth` (default 10), `cdp_ports` (default None, dict mapping app names to debugging ports), `cdp_discover` (default True, auto-scans /proc for --remote-debugging-port), `scale_factor` (default None, auto-detects from Xft.dpi/Win32 per-monitor DPI; pass a float to override), and `cdp_refresh_interval` (default 5.0, seconds between automatic CDP refresh cycles). Set-and-forget flags, not per-call parameters.
-- **`source=` parameter** on `elements()`, `find()`, `wait_for()` controls element sources: `"full"` (default) merges native platform UI (toolbar, tabs, menus) with CDP web content for browser/Electron apps; `"ax"` returns CDP AX tree only (web content, no native merge); `"native"` returns platform-native elements only (no web content); `"dom"` uses the CDP DOM walker instead of the AX tree. For non-CDP apps, `"full"` and `"native"` produce platform-native results; `"ax"` and `"dom"` raise `TouchpointError` because they explicitly request CDP-specific sources.
+- `configure()` has exactly **10 knobs**: `fuzzy_threshold` (default 0.6), `fallback_input` (default True), `type_chunk_size` (default 40, splits long text into chunks for xdotool), `max_elements` (default 5000), `max_depth` (default 20), `cdp_ports` (default None, dict mapping app names to debugging ports), `cdp_discover` (default True, auto-scans /proc for --remote-debugging-port), `scale_factor` (default None, auto-detects from Xft.dpi/Win32 per-monitor DPI; pass a float to override), `cdp_refresh_interval` (default 5.0, seconds between automatic CDP refresh cycles), and `ax_messaging_timeout` (default 1.0, maximum seconds to wait for a macOS AX app reply). Set-and-forget flags, not per-call parameters. Called with **no arguments**, `configure()` returns a copy of the current config dict — useful for reading the active configuration without modifying it.
+- **`source=` parameter** on `elements()`, `find()`, `wait_for()` controls element sources: `"full"` (default) merges native platform UI (toolbar, tabs, menus) with CDP web content for browser/Electron apps; `"cdp_ax"` returns the CDP AX tree only (web content, no native merge); `"native"` returns platform-native elements only (no web content); `"dom"` uses the CDP DOM walker instead of the AX tree. `"ax"` remains a compatibility alias for `"cdp_ax"`. For non-CDP apps, `"full"` and `"native"` produce platform-native results; `"cdp_ax"` and `"dom"` raise `TouchpointError` because they explicitly request CDP-specific sources.
 
 ### Parameter split — Backend ABC vs Public API:
 - **Backend methods** (`get_applications`, `get_windows`, `get_elements`, etc.) handle **scoping only** — they determine *which subtree* to walk. Parameters: `app`, `window_id`, `tree`, `max_depth`, `root_element`. Backends also accept optional **filter hints** (`role`, `states`) that are applied as early-skip checks during the walk when `tree=False` — non-matching elements are never built, but their children are still visited (a non-matching parent may have matching descendants). When `tree=True`, hints are ignored because the tree structure requires all nodes.
@@ -483,11 +527,11 @@ Stages run in order; if an earlier stage produces results the later stages are s
 The `source=` parameter controls how elements are collected for browser/Electron apps:
 
 - **Full** (`source="full"`, default): Merges platform-native UI elements (toolbar, tabs, address bar, menus via AT-SPI/UIA) with CDP web content (AX tree). Native elements are collected first with a budget, then CDP fills the remainder.
-- **AX tree** (`source="ax"`): `Accessibility.getFullAXTree` returns the browser's accessibility tree only. Fast, semantically rich (roles, states, names), but covers only web content — no native toolbar/menu elements.
+- **AX tree** (`source="cdp_ax"`): `Accessibility.getFullAXTree` returns the browser's accessibility tree only. Fast, semantically rich (roles, states, names), but covers only web content — no native toolbar/menu elements. The older `source="ax"` spelling remains a compatibility alias.
 - **Native** (`source="native"`): Platform backend only (AT-SPI on Linux, UIA on Windows). Returns native UI elements without any CDP web content. Useful for interacting with the browser chrome (toolbar, tabs, menus) without the noise of web content.
 - **DOM walker** (`source="dom"`): `Runtime.evaluate` runs a JS function that walks the live DOM, collecting tag names, attributes, text content, and bounding rectangles. Catches elements the AX tree misses but produces noisier output with less semantic information.
 
-For non-CDP apps, `"full"` and `"native"` produce platform-native results.  `"ax"` and `"dom"` raise `TouchpointError` because they explicitly request CDP-specific element sources.
+For non-CDP apps, `"full"` and `"native"` produce platform-native results.  `"cdp_ax"` and `"dom"` raise `TouchpointError` because they explicitly request CDP-specific element sources.
 
 ### Dialog Auto-Dismiss
 
@@ -534,7 +578,7 @@ Key design decisions:
 
 ## Dependencies
 
-All dependencies are installed automatically via `pip install touchpoint-py`. Platform-specific packages use `sys_platform` markers so only the right ones are installed.
+All dependencies are installed automatically via `pip install touchpoint`. Platform-specific packages use `sys_platform` markers so only the right ones are installed.
 
 | Package | What for | Platform |
 |---------|----------|----------|
@@ -558,16 +602,16 @@ All dependencies are installed automatically via `pip install touchpoint-py`. Pl
 | `core/element.py` | Complete | 17-field dataclass |
 | `core/window.py` | Complete | 9-field dataclass |
 | `core/exceptions.py` | Complete | 3 exception classes |
-| `backends/base.py` | Complete | Backend ABC (10 abstract + 7 concrete) + InputProvider ABC (9 methods) |
+| `backends/base.py` | Complete | Backend ABC (12 abstract + 12 concrete) + InputProvider ABC (9 methods) |
 | `backends/linux/atspi.py` | Complete | Full AT-SPI2 implementation, live-tested |
 | `backends/linux/x11/input.py` | Complete | XdotoolInput — full xdotool implementation |
 | `backends/windows/input.py` | Complete | SendInputProvider — full ctypes implementation |
-| `backends/windows/uia.py` | Complete | Full UIA implementation via comtypes |
+| `backends/windows/uia.py` | Complete | Full UIA implementation via comtypes; per-thread COM sessions and lightweight search candidates |
 | `backends/macos/ax.py` | Complete | macOS AX backend via pyobjc, live-tested |
 | `backends/macos/input.py` | Complete | CGEventInput — CGEvent via pyobjc |
 | `backends/cdp/cdp.py` | Complete | CDP Backend (Electron/Chromium apps via WebSocket) |
 | `__init__.py` | Complete | Public API (discovery, find, wait, actions, input, fallback, configure) |
-| `mcp/server.py` | Complete | MCP server — 19 tools, instructions-based guidance (touchpoint-mcp entry point) |
+| `mcp/server.py` | Complete | MCP server — vision and no-vision modes, instructions-based guidance, auto-verify flags on supported action tools (touchpoint-mcp entry point) |
 | `matching/matcher.py` | Complete | 4-stage pipeline (exact → contains → contains-words → fuzzy) |
 | `format/formatter.py` | Complete | flat / json / tree formatters |
 | `utils/screenshot.py` | Complete | Full-screen + region capture via Pillow |
@@ -581,10 +625,10 @@ All dependencies are installed automatically via `pip install touchpoint-py`. Pl
 - **Async CDP architecture** — The sync `websocket-client` inside `conn.send()` blocks on every CDP call, forces inline auto-dismiss of JS dialogs (no way to surface them to the agent), and serialises multi-tab operations. Moving to async WebSocket + event loop would enable: proper dialog queuing for agent inspection, concurrent multi-tab queries, and CDP event subscriptions (navigation, console, network).
 
 ### Medium Priority
-- **Text selection tool** — Add `select_text(element_id, text)` to programmatically select text within elements. The agent-facing API is text-based (pass the substring to select — natural for agents, no offset counting); the Backend ABC exposes the low-level `select_text(element_id, start, end)` with character offsets; the public API bridges them by reading the element's text content, finding the substring, and calling the backend with offsets. All four backends have native support: AT-SPI2 has `Text.setSelection()` via D-Bus, UIA has `ITextRangeProvider.Select()` via `TextPattern` (currently unused), macOS AX has settable `AXSelectedTextRange`, and CDP can use `element.setSelectionRange()` for inputs or `Selection.setBaseAndExtent()` for contentEditable.
-- **Window management tools** — Add `minimize_window`, `maximize_window`, `close_window`, `move_window`, `resize_window` convenience tools. All three platforms have native support: AT-SPI2 exposes window actions + `Component.set_position/set_size`, UIA has `WindowPattern` (Close/SetVisualState) + `TransformPattern` (Move/Resize), macOS AX has `AXMinimize`/`AXClose` buttons + settable `AXPosition`/`AXSize`, and CDP has `Browser.setWindowBounds` + `Target.closeTarget`. Currently agents must find and click title-bar buttons (which may not be in the a11y tree depending on toolkit/theme). Follows the same native-first, fallback pattern as click: try accessibility action first, fall back to OS-level APIs (e.g. `xdotool`/`wmctrl`/KWin D-Bus on Linux, `SetWindowPlacement` on Windows). Declare on Backend ABC, implement per-backend, expose via public API and MCP server.
-- **Backend role/state inference parity** — CDP leads in role coverage (57/59) and now detects INDETERMINATE for tri-state checkboxes. AT-SPI2 has full state coverage (33/33) and added SWITCH, TIMER, METER role mappings (now 53/59 — remaining gaps are FEED, NOTE, ALERT_DIALOG, and landmark subtypes which AT-SPI2 doesn't distinguish). UIA states improved significantly (24/33 after adding INDETERMINATE, REQUIRED, BUSY, HORIZONTAL, VERTICAL, HAS_POPUP) but its **role coverage remains the weakest at 36/59** — many high-impact gaps (HEADING, LABEL, ALERT, landmarks) are closeable via `AriaRole`/`AriaProperties`. Remaining feasible UIA state gaps: RESIZABLE (Window pattern), INVALID (`IsDataValidForForm`), MULTISELECTABLE (Selection pattern). macOS AX sits at 46/59 roles, 26/33 states with feasible gaps in PRESSED, ACTIVE, MULTISELECTABLE via existing AX attributes. The biggest remaining cross-backend gap is **UIA role mappings** — agents on Windows see far more UNKNOWN roles than on other platforms.
-- **Batch action tool** — MCP tool that accepts a list of actions and executes them sequentially server-side, reducing LLM round trips for known workflows (e.g. fill a row of cells: click → type → tab → type → tab → type). Action tools only (no discovery), stop on error, no variables/piping. Depends on user demand — `type_text` with `\t`/`\n` already covers the most common case.
+- **Long-running MCP sessions** — Alias maps intentionally preserve stable short IDs for the session but currently have no cap or reset mechanism. Add lifecycle-aware eviction or an explicit reset operation before using one MCP process as a long-lived multi-tenant service.
+- **macOS AX hard timeout fallback** — Application and descendant references now use `AXUIElementSetMessagingTimeout`, and application-level `kAXErrorCannotComplete` responses are reported. If a bridge-level call can still exceed that native limit in practice, isolate reads behind a bounded worker so one stale app cannot stall a desktop-wide traversal.
+- **Native container text aggregation** — AT-SPI2 and CDP can return recursive container text, while macOS AX and some UIA containers expose only their own text attributes. Add a separate recursive read path for MCP `read_text()` so its behavior is consistent without changing the offset contract used by `select_text()`.
+- **Backend role/state inference parity** — CDP still leads role coverage, while macOS AX remains close behind and AT-SPI2 has the broadest native state coverage. UIA now refines heading, alert, label, and landmark roles from heading, ARIA, and landmark metadata; it also detects `RESIZABLE`, `INVALID`, and `MULTISELECTABLE` from native UIA patterns and properties. Windows still has the largest long-tail role gap because provider-specific controls frequently expose generic or unknown control types. Continue expanding UIA mappings only from live provider evidence.
 - Wayland input backend (when X11/xdotool isn't available — `libei` / `xdg-desktop-portal` RemoteDesktop)
 
 ### Lower Priority

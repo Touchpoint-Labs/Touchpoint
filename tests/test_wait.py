@@ -36,6 +36,72 @@ class TestWaitValidation:
         with pytest.raises(ValueError, match="mode"):
             tp.wait_for("anything", mode="bad", gone=True)
 
+    def test_wait_for_new_ignores_existing_matches(self, monkeypatch):
+        """The baseline query must collect all existing IDs before polling."""
+        existing = Element(
+            id="ax:1:win:0",
+            name="Ready",
+            role=Role.TEXT,
+            states=[],
+            position=(0, 0),
+            size=(0, 0),
+            app="Test",
+            pid=1,
+            backend="ax",
+            raw_role="AXStaticText",
+        )
+        new = Element(
+            id="ax:1:win:1",
+            name="Ready",
+            role=Role.TEXT,
+            states=[],
+            position=(0, 0),
+            size=(0, 0),
+            app="Test",
+            pid=1,
+            backend="ax",
+            raw_role="AXStaticText",
+        )
+        max_results_seen: list[int | None] = []
+
+        def fake_find(_query, **kwargs):
+            max_results_seen.append(kwargs["max_results"])
+            if len(max_results_seen) == 1:
+                return [existing]
+            return [existing, new]
+
+        monkeypatch.setattr(tp, "find", fake_find)
+
+        assert tp.wait_for("Ready", wait_for_new=True, timeout=0) == [new]
+        assert max_results_seen == [None, 5]
+
+    def test_wait_for_deduplicates_queries(self, monkeypatch):
+        """Repeated queries should share one scan per polling cycle."""
+        existing = Element(
+            id="ax:1:win:0",
+            name="Ready",
+            role=Role.TEXT,
+            states=[],
+            position=(0, 0),
+            size=(0, 0),
+            app="Test",
+            pid=1,
+            backend="ax",
+            raw_role="AXStaticText",
+        )
+        queries = []
+
+        def fake_find(query, **_kwargs):
+            queries.append(query)
+            return [existing]
+
+        monkeypatch.setattr(tp, "find", fake_find)
+
+        assert tp.wait_for(["Ready", "Ready"], mode="all", timeout=0) == [
+            existing,
+        ]
+        assert queries == ["Ready"]
+
 
 # -----------------------------------------------------------------------
 # wait_for — integration

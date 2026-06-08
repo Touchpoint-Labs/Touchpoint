@@ -30,6 +30,7 @@ import sys
 import pytest
 
 import touchpoint as tp
+import touchpoint._state as _st
 from touchpoint.core.element import Element
 from touchpoint.core.types import Role, State
 from touchpoint.core.window import Window
@@ -42,15 +43,21 @@ from touchpoint.core.window import Window
 @pytest.fixture(autouse=True)
 def _restore_config():
     """Save config before each test and restore it after."""
-    original = tp._config.copy()
-    original_cdp = tp._cdp_backend
-    original_cdp_attempted = tp._cdp_attempted
-    original_input = tp._input_provider
+    original = _st._config.copy()
+    original_backend = _st._backend
+    original_cdp = _st._cdp_backend
+    original_cdp_attempted = _st._cdp_attempted
+    original_input = _st._input_provider
     yield
-    tp._config.update(original)
-    tp._cdp_backend = original_cdp
-    tp._cdp_attempted = original_cdp_attempted
-    tp._input_provider = original_input
+    _st._config.update(original)
+    _st._backend = original_backend
+    if original_backend is not None:
+        setter = getattr(original_backend, "set_messaging_timeout", None)
+        if setter is not None:
+            setter(float(original["ax_messaging_timeout"]))
+    _st._cdp_backend = original_cdp
+    _st._cdp_attempted = original_cdp_attempted
+    _st._input_provider = original_input
 
 
 # -----------------------------------------------------------------------
@@ -195,6 +202,21 @@ skip_without_cdp = pytest.mark.skipif(
 # -----------------------------------------------------------------------
 # Assertion helpers
 # -----------------------------------------------------------------------
+
+_BOGUS_ELEMENT_ID_BY_PLATFORM = {
+    "linux": "atspi:9999999:99999:0.1.2",
+    "darwin": "ax:9999999:zzz:0.1.2",
+    "win32": "uia:9999999:99999.99",
+}
+
+
+def bogus_element_id() -> str:
+    """Return a well-formed but nonexistent element ID for this platform."""
+    element_id = _BOGUS_ELEMENT_ID_BY_PLATFORM.get(sys.platform)
+    if element_id is None:
+        pytest.skip(f"no bogus element ID template for {sys.platform}")
+    return element_id
+
 
 def assert_valid_element(el: Element) -> None:
     """Assert that an Element has well-formed fields.

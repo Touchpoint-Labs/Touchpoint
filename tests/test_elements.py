@@ -14,6 +14,7 @@ import touchpoint as tp
 from touchpoint.core.types import Role, State
 from tests.conftest import (
     assert_valid_element,
+    bogus_element_id,
     skip_without_backend,
 )
 
@@ -151,6 +152,142 @@ class TestElementsValidation:
     def test_sort_by_invalid_raises(self):
         with pytest.raises(ValueError, match="unknown sort_by"):
             tp.elements(sort_by="invalid")
+
+
+@pytest.mark.unit
+class TestWindowsUiaDirectRoleControlTypes:
+    """UIA fast-path ControlType filters must match canonical role mapping."""
+
+    def test_direct_control_types_match_canonical_roles(self):
+        from touchpoint.backends.windows.uia import (
+            _DIRECT_ROLE_CONTROL_TYPES,
+            _UIA_ROLE_MAP,
+        )
+
+        for role, control_types in _DIRECT_ROLE_CONTROL_TYPES.items():
+            for control_type in control_types:
+                assert _UIA_ROLE_MAP[control_type] == role, (
+                    f"ControlType {control_type} fast-path maps to {role}, "
+                    f"but canonical UIA mapping is {_UIA_ROLE_MAP[control_type]}"
+                )
+
+    def test_structural_control_types_are_complete(self):
+        from touchpoint.backends.windows.uia import _DIRECT_ROLE_CONTROL_TYPES
+
+        expected = {
+            Role.TOOLBAR: (50021, 50040),
+            Role.TABLE: (50028, 50036),
+            Role.TABLE_ROW: (50029,),
+            Role.HEADER: (50034,),
+            Role.TABLE_COLUMN_HEADER: (50035,),
+            Role.TITLE_BAR: (50037,),
+            Role.SEPARATOR: (50038,),
+        }
+
+        for role, control_types in expected.items():
+            assert _DIRECT_ROLE_CONTROL_TYPES[role] == control_types
+        assert Role.TABLE_CELL not in _DIRECT_ROLE_CONTROL_TYPES
+
+
+@pytest.mark.unit
+class TestWindowsUiaThreadSessions:
+    """UIA COM objects are rebound when public calls move between threads."""
+
+    def test_ensure_thread_uia_creates_and_reuses_current_thread_session(
+        self, monkeypatch,
+    ):
+        import threading
+
+        from touchpoint.backends.windows import uia as mod
+
+        backend = mod.UiaBackend.__new__(mod.UiaBackend)
+        backend._uia = object()
+        backend._root = object()
+        backend._module = object()
+        backend._runtime_map = {}
+        backend._uia_thread = object()
+        backend._thread_sessions = {}
+        backend._session_lock = threading.RLock()
+
+        created = (object(), object(), object())
+        calls = []
+        monkeypatch.setattr(
+            mod,
+            "_init_uia",
+            lambda: calls.append(True) or created,
+        )
+
+        backend._ensure_thread_uia()
+
+        current_thread = threading.current_thread()
+        session = backend._thread_sessions[current_thread]
+        assert calls == [True]
+        assert (backend._uia, backend._root, backend._module) == created
+        assert backend._runtime_map is session[3]
+
+        backend._ensure_thread_uia()
+        assert calls == [True]
+
+    def test_resolve_direct_match_id_after_session_cache_miss(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from touchpoint.backends.windows import uia as mod
+
+        root = object()
+        window = SimpleNamespace(CurrentProcessId=7, CurrentControlType=50032)
+        matched = object()
+
+        class Walker:
+            def GetFirstChildElement(self, element):
+                assert element is root
+                return window
+
+            def GetNextSiblingElement(self, _element):
+                return None
+
+        walker = Walker()
+        backend = mod.UiaBackend.__new__(mod.UiaBackend)
+        backend._uia = SimpleNamespace(ControlViewWalker=walker)
+        backend._root = root
+        backend._runtime_map = {}
+        calls = []
+        backend._find_descendant_by_runtime_id = (
+            lambda parent, runtime_id, active_walker:
+                calls.append((parent, runtime_id, active_walker)) or matched
+        )
+        monkeypatch.setattr(
+            mod,
+            "_get_runtime_id",
+            lambda element: "42.7" if element is window else "unexpected",
+        )
+
+        element_id = "uia:7:42.7:match:42.99"
+        assert backend._resolve_element(element_id) is matched
+        assert backend._runtime_map[element_id] is matched
+        assert calls == [(window, "42.99", walker)]
+
+
+@pytest.mark.unit
+class TestWindowsUiaLightweightFiltering:
+    """Lightweight UIA candidates defer expensive state translation."""
+
+    def test_check_filter_skips_states_without_state_constraint(self):
+        from touchpoint.backends.windows import uia as mod
+
+        backend = mod.UiaBackend.__new__(mod.UiaBackend)
+        backend._filter_named_only = False
+        backend._filter_role = None
+        backend._filter_states = None
+        backend._translate_role = lambda _element: (Role.BUTTON, "Button")
+        backend._translate_states = lambda _element: pytest.fail(
+            "lightweight filtering should defer state translation"
+        )
+
+        assert backend._check_filter(object(), lightweight=True) == (
+            Role.BUTTON,
+            "Button",
+            [],
+        )
 
 
 # -----------------------------------------------------------------------
@@ -352,8 +489,8 @@ class TestGetElement:
         assert refreshed.app == any_element.app
         assert_valid_element(refreshed)
 
-    def test_invalid_id(self):
-        result = tp.get_element("nonexistent:99:99:99")
+    def test_missing_id(self):
+        result = tp.get_element(bogus_element_id())
         assert result is None
 
 

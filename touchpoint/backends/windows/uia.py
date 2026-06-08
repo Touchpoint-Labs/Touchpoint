@@ -9,7 +9,7 @@ that only expose a few elements via UIA should use the CDP backend
 instead.
 
 Requires:
-    - Python package: ``comtypes`` (installed automatically with ``pip install touchpoint-py``)
+    - Python package: ``comtypes`` (installed automatically with ``pip install touchpoint``)
     - Windows 7+ (UIA is built into the OS)
 
 Usage::
@@ -26,9 +26,17 @@ Usage::
 from __future__ import annotations
 
 import sys
+import threading
+from functools import wraps
 from typing import Any
 
-from touchpoint.backends.base import Backend
+from touchpoint.backends.base import (
+    Backend,
+    make_element_not_found_error,
+    make_malformed_element_id_error,
+    make_malformed_window_id_error,
+    make_window_not_found_error,
+)
 from touchpoint.core.element import Element
 from touchpoint.core.exceptions import ActionFailedError
 from touchpoint.core.types import Role, State
@@ -46,17 +54,15 @@ from touchpoint.core.window import Window
 # ---------------------------------------------------------------------------
 
 _UIA_ROLE_MAP: dict[int, Role] = {
-    # Containers / Structure
-    50033: Role.APPLICATION,      # AppBar (closest UIA equivalent)
-    50032: Role.WINDOW,           # Window
-    50034: Role.PANEL,            # Pane — generic container
+    # Canonical IDs from UIAutomationClient.h.  See:
+    # https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-controltype-ids
 
     # Interactive
     50000: Role.BUTTON,           # Button
-    50001: Role.GROUP,            # Calendar (container, no exact match)
+    50001: Role.GROUP,            # Calendar (no exact match)
     50002: Role.CHECK_BOX,        # CheckBox
     50003: Role.COMBO_BOX,        # ComboBox
-    50004: Role.TEXT_FIELD,        # Edit
+    50004: Role.TEXT_FIELD,       # Edit
     50005: Role.LINK,             # Hyperlink
     50006: Role.IMAGE,            # Image
     50007: Role.LIST_ITEM,        # ListItem
@@ -70,7 +76,7 @@ _UIA_ROLE_MAP: dict[int, Role] = {
     50015: Role.SLIDER,           # Slider
     50016: Role.SPIN_BUTTON,      # Spinner
     50017: Role.STATUS_BAR,       # StatusBar
-    50018: Role.TAB_LIST,         # Tab (the tab strip / container)
+    50018: Role.TAB_LIST,         # Tab (tab strip / container)
     50019: Role.TAB,              # TabItem (individual tab page)
     50020: Role.TEXT,             # Text (static label)
     50021: Role.TOOLBAR,          # ToolBar
@@ -81,18 +87,22 @@ _UIA_ROLE_MAP: dict[int, Role] = {
     50026: Role.GROUP,            # Group
     # 50027 (Thumb) intentionally omitted — falls to UNKNOWN.
     50028: Role.TABLE,            # DataGrid
-    50029: Role.TABLE_CELL,       # DataItem
+    50029: Role.TABLE_ROW,        # DataItem (row in a DataGrid)
     50030: Role.DOCUMENT,         # Document
     50031: Role.SPLIT_BUTTON,     # SplitButton
-    50035: Role.HEADER,           # Header
-    50036: Role.TABLE_COLUMN_HEADER,  # HeaderItem
-    50037: Role.TABLE,            # Table
-    50038: Role.TITLE_BAR,        # TitleBar
-    50039: Role.SEPARATOR,        # Separator
+
+    # Containers / Structure
+    50032: Role.WINDOW,           # Window
+    50033: Role.PANEL,            # Pane (generic container; UWP/Electron toplevel)
+    50034: Role.HEADER,           # Header
+    50035: Role.TABLE_COLUMN_HEADER,  # HeaderItem
+    50036: Role.TABLE,            # Table
+    50037: Role.TITLE_BAR,        # TitleBar
+    50038: Role.SEPARATOR,        # Separator
 
     # Windows 8+ additions
-    50040: Role.PANEL,            # SemanticZoom
-    50041: Role.APPLICATION,      # AppBar
+    50039: Role.PANEL,            # SemanticZoom (no exact match)
+    50040: Role.TOOLBAR,          # AppBar (UWP/WinRT toolbar surface)
 }
 
 # Roles that imply CLICKABLE state (consistent with CDP / AT-SPI).
@@ -101,6 +111,123 @@ _CLICKABLE_ROLES = frozenset({
     Role.TOGGLE_BUTTON, Role.SWITCH, Role.SPLIT_BUTTON,
     Role.COMBO_BOX, Role.TAB,
 })
+
+# Flat walks don't need to descend into obviously leaf-like controls.
+# Skipping these reduces COM churn and avoids unstable providers that
+# throw during child enumeration for simple controls.
+_FLAT_LEAF_ROLES = frozenset({
+    Role.ALERT,
+    Role.ALERT_DIALOG,
+    Role.BUTTON,
+    Role.CHECK_BOX,
+    Role.CHECK_MENU_ITEM,
+    Role.HEADING,
+    Role.IMAGE,
+    Role.LABEL,
+    Role.LINK,
+    Role.MENU_ITEM,
+    Role.NOTE,
+    Role.PARAGRAPH,
+    Role.PASSWORD_TEXT,
+    Role.PROGRESS_BAR,
+    Role.RADIO_BUTTON,
+    Role.RADIO_MENU_ITEM,
+    Role.SEPARATOR,
+    Role.SPIN_BUTTON,
+    Role.SPLIT_BUTTON,
+    Role.STATUS_BAR,
+    Role.SWITCH,
+    Role.TAB,
+    Role.TABLE_CELL,
+    Role.TABLE_COLUMN_HEADER,
+    Role.TABLE_ROW_HEADER,
+    Role.TEXT,
+    Role.TEXT_FIELD,
+    Role.TOGGLE_BUTTON,
+    Role.TOOLTIP,
+})
+
+# Exact ControlType matches that can be searched directly through UIA
+# without walking the full tree. We only include roles whose mapping is
+# unambiguous in UIA and safe to use as a fast-path filter.
+_DIRECT_ROLE_CONTROL_TYPES: dict[Role, tuple[int, ...]] = {
+    Role.BUTTON: (50000,),
+    Role.CHECK_BOX: (50002,),
+    Role.COMBO_BOX: (50003,),
+    Role.IMAGE: (50006,),
+    Role.LINK: (50005,),
+    Role.LIST: (50008,),
+    Role.LIST_ITEM: (50007,),
+    Role.MENU: (50009,),
+    Role.MENU_BAR: (50010,),
+    Role.MENU_ITEM: (50011,),
+    Role.PROGRESS_BAR: (50012,),
+    Role.RADIO_BUTTON: (50013,),
+    Role.SCROLL_BAR: (50014,),
+    Role.SLIDER: (50015,),
+    Role.SPIN_BUTTON: (50016,),
+    Role.STATUS_BAR: (50017,),
+    Role.TAB_LIST: (50018,),
+    Role.TAB: (50019,),
+    Role.TEXT: (50020,),
+    Role.TOOLBAR: (50021, 50040),
+    Role.TOOLTIP: (50022,),
+    Role.TREE: (50023,),
+    Role.TREE_ITEM: (50024,),
+    Role.TABLE: (50028, 50036),
+    Role.TABLE_ROW: (50029,),
+    Role.DOCUMENT: (50030,),
+    Role.SPLIT_BUTTON: (50031,),
+    Role.WINDOW: (50032,),
+    Role.HEADER: (50034,),
+    Role.TABLE_COLUMN_HEADER: (50035,),
+    Role.TITLE_BAR: (50037,),
+    Role.SEPARATOR: (50038,),
+}
+
+# ARIA role / landmark refinements help close UIA's parity gap with
+# AX/CDP for web-backed controls exposed through browsers and Electron.
+_UIA_ARIA_ROLE_MAP: dict[str, Role] = {
+    "alert": Role.ALERT,
+    "alertdialog": Role.ALERT_DIALOG,
+    "article": Role.ARTICLE,
+    "banner": Role.BANNER,
+    "checkbox": Role.CHECK_BOX,
+    "contentinfo": Role.CONTENT_INFO,
+    "figure": Role.FIGURE,
+    "form": Role.FORM,
+    "heading": Role.HEADING,
+    "label": Role.LABEL,
+    "log": Role.LOG,
+    "main": Role.LANDMARK,
+    "menuitemcheckbox": Role.CHECK_MENU_ITEM,
+    "menuitemradio": Role.RADIO_MENU_ITEM,
+    "meter": Role.METER,
+    "navigation": Role.NAVIGATION,
+    "note": Role.NOTE,
+    "paragraph": Role.PARAGRAPH,
+    "radio": Role.RADIO_BUTTON,
+    "region": Role.LANDMARK,
+    "search": Role.SEARCH,
+    "switch": Role.SWITCH,
+    "textbox": Role.TEXT_FIELD,
+}
+
+_UIA_LANDMARK_TYPE_MAP: dict[int, Role] = {
+    80001: Role.FORM,        # UIA_FormLandmarkTypeId
+    80002: Role.LANDMARK,    # UIA_MainLandmarkTypeId
+    80003: Role.NAVIGATION,  # UIA_NavigationLandmarkTypeId
+    80004: Role.SEARCH,      # UIA_SearchLandmarkTypeId
+}
+
+_UIA_LOCALIZED_LANDMARK_MAP: dict[str, Role] = {
+    "banner": Role.BANNER,
+    "contentinfo": Role.CONTENT_INFO,
+    "form": Role.FORM,
+    "main": Role.LANDMARK,
+    "navigation": Role.NAVIGATION,
+    "search": Role.SEARCH,
+}
 
 # ---------------------------------------------------------------------------
 # State mapping: UIA property values → Touchpoint State
@@ -118,13 +245,13 @@ _CLICKABLE_ROLES = frozenset({
 _UIA_WINDOW_CONTROL_TYPE = 50032  # Window
 
 # Top-level control types that represent application windows.
-# Window (50032) is the standard.  Pane (50034) covers UWP apps.
-# AppBar (50033) covers Electron/Chromium apps that report their
-# top-level as AppBar instead of Window, plus system chrome like
-# the Taskbar and Program Manager (desktop) — agents need these
-# for launching apps, switching windows, and interacting with
-# desktop icons, matching Linux AT-SPI behavior.
-_UIA_TOPLEVEL_TYPES = (50032, 50033, 50034)
+# Window (50032) is the standard.  Pane (50033) covers UWP/Electron
+# apps that report their top-level as a generic Pane instead of
+# Window, plus system chrome like the Taskbar and Program Manager
+# (desktop) — agents need these for launching apps, switching
+# windows, and interacting with desktop icons, matching Linux
+# AT-SPI behavior.
+_UIA_TOPLEVEL_TYPES = (50032, 50033)
 
 # Transient popup types that appear as top-level desktop children
 # but are not application windows.  Context menus and popup menus
@@ -132,6 +259,15 @@ _UIA_TOPLEVEL_TYPES = (50032, 50033, 50034)
 # WS_EX_TOOLWINDOW / WS_EX_NOACTIVATE style filter because popups
 # normally carry those styles by design.
 _UIA_POPUP_TYPES = (50009,)  # Menu
+
+
+def _uia_thread_bound(fn):
+    """Run a backend entry point with UIA objects for the current thread."""
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        self._ensure_thread_uia()
+        return fn(self, *args, **kwargs)
+    return wrapper
 
 
 class UiaBackend(Backend):
@@ -171,6 +307,12 @@ class UiaBackend(Backend):
         self._root: Any | None = None        # Desktop root element
         self._module: Any | None = None      # comtypes UIA module reference
         self._runtime_map: dict[str, Any] = {}  # element_id → IUIAutomationElement
+        self._uia_thread: threading.Thread | None = None
+        self._thread_sessions: dict[
+            threading.Thread,
+            tuple[Any, Any, Any, dict[str, Any]],
+        ] = {}
+        self._session_lock = threading.RLock()
         self._uwp_names: dict[int, str] = {}     # ApplicationFrameHost PID → real app name
         self._element_count: int = 0             # per-call element counter
         self._max_elements: int = sys.maxsize      # per-call limit
@@ -180,11 +322,37 @@ class UiaBackend(Backend):
 
         try:
             self._uia, self._root, self._module = _init_uia()
+            self._uia_thread = threading.current_thread()
+            self._thread_sessions[self._uia_thread] = (
+                self._uia, self._root, self._module, self._runtime_map,
+            )
         except Exception:
             # comtypes not installed, or UIA init failed.
             pass
 
     # -- Availability -----------------------------------------------------
+
+    def _ensure_thread_uia(self) -> None:
+        """Bind UIA COM objects created on the current calling thread."""
+        if not hasattr(self, "_uia") or self._uia is None:
+            return
+        if not hasattr(self, "_thread_sessions"):
+            return
+
+        current_thread = threading.current_thread()
+        if self._uia_thread is current_thread:
+            return
+
+        with self._session_lock:
+            if self._uia_thread is current_thread:
+                return
+            session = self._thread_sessions.get(current_thread)
+            if session is None:
+                uia, root, module = _init_uia()
+                session = (uia, root, module, {})
+                self._thread_sessions[current_thread] = session
+            self._uia, self._root, self._module, self._runtime_map = session
+            self._uia_thread = current_thread
 
     def is_available(self) -> bool:
         """Check if UIA is accessible.
@@ -306,6 +474,7 @@ class UiaBackend(Backend):
         """
         return sorted({w.app for w in self.get_windows() if w.app})
 
+    @_uia_thread_bound
     def get_windows(self) -> list[Window]:
         """List all top-level windows from the UIA tree.
 
@@ -370,6 +539,11 @@ class UiaBackend(Backend):
         child = walker.GetFirstChildElement(self._root)
 
         while child is not None:
+            next_child = None
+            try:
+                next_child = walker.GetNextSiblingElement(child)
+            except Exception:
+                pass
             try:
                 ct = child.CurrentControlType
                 if ct in _UIA_TOPLEVEL_TYPES:
@@ -388,13 +562,11 @@ class UiaBackend(Backend):
                             windows.append(win)
             except Exception:
                 pass
-            try:
-                child = walker.GetNextSiblingElement(child)
-            except Exception:
-                break
+            child = next_child
 
         return windows
 
+    @_uia_thread_bound
     def get_elements(
         self,
         app: str | None = None,
@@ -426,10 +598,9 @@ class UiaBackend(Backend):
                 everything.
             root_element: Start from this element id instead of
                 the window roots.
-            lightweight: Ignored on UIA.  UIA's ``CacheRequest``
-                batches property reads at the COM level, so
-                skipping individual properties saves negligible
-                time.  A full walk is always performed.
+            lightweight: If ``True``, build cheap candidate elements
+                for search and defer expensive properties until a
+                matching element is inflated.
             max_elements: Maximum number of elements to collect.
                 Normally supplied by :func:`~touchpoint.elements`
                 from the global config.  ``None`` imposes no cap.
@@ -469,12 +640,8 @@ class UiaBackend(Backend):
         # COM pointers don't accumulate across repeated walks.
         self._runtime_map.clear()
 
-        # UIA's CacheRequest batches property reads at the COM level,
-        # so skipping individual properties (position, actions, value)
-        # saves negligible time.  Always do a full walk to avoid
-        # returning elements with placeholder (0,0) positions.
-        _build = self._build_element
-        _collect = self._collect_flat
+        _build = self._build_light_element if lightweight else self._build_element
+        _collect = self._collect_light_flat if lightweight else self._collect_flat
 
         # -- root_element: resolve and walk from a specific node ----------
         if root_element is not None:
@@ -494,6 +661,11 @@ class UiaBackend(Backend):
             idx = 0
 
             while child is not None:
+                next_child = None
+                try:
+                    next_child = walker.GetNextSiblingElement(child)
+                except Exception:
+                    pass
                 if self._element_count >= self._max_elements:
                     break
                 eid = f"{root_element}.{idx}"
@@ -503,11 +675,12 @@ class UiaBackend(Backend):
                             child, app_name, pid, eid,
                             root_element, max_depth, 0,
                             window_id=win_id,
+                            walker=walker,
                         )
                         if node is not None:
                             elements.append(node)
                     else:
-                        pre = self._check_filter(child)
+                        pre = self._check_filter(child, lightweight=lightweight)
                         if pre is not None:
                             el = _build(
                                 child, app_name, pid, eid,
@@ -518,8 +691,12 @@ class UiaBackend(Backend):
                                 self._element_count += 1
                                 elements.append(el)
                         recurse = max_depth is None or max_depth > 0
+                        _role = pre[0] if pre is not None else None
+                        if recurse and _role is None:
+                            _role = self._translate_role(child)[0]
+                        if recurse and _role in _FLAT_LEAF_ROLES:
+                            recurse = False
                         if recurse and self._skip_subtree_roles is not None:
-                            _role = pre[0] if pre is not None else self._translate_role(child)[0]
                             if _role in self._skip_subtree_roles:
                                 recurse = False
                         if recurse:
@@ -527,27 +704,38 @@ class UiaBackend(Backend):
                                 child, app_name, pid, eid,
                                 elements, max_depth, 1,
                                 window_id=win_id,
+                                walker=walker,
+                                node_role=_role,
                             )
                 except (ValueError, OSError):
                     pass  # stale COM pointer — skip
                 idx += 1
-                try:
-                    child = walker.GetNextSiblingElement(child)
-                except Exception:
-                    break
+                child = next_child
 
             return elements
 
         # -- Normal path: walk from window roots -------------------------
         roots = self._get_roots(app, window_id)
+        if (not tree and root_element is None
+                and states is None and role is not None):
+            direct = self._get_elements_by_control_type(
+                roots, role, named_only=named_only, lightweight=lightweight,
+            )
+            if direct is not None:
+                return direct
         elements = []
+        walker = self._uia.ControlViewWalker
 
         for win_el, app_name, pid, win_id in roots:
-            walker = self._uia.ControlViewWalker
             child = walker.GetFirstChildElement(win_el)
             idx = 0
 
             while child is not None:
+                next_child = None
+                try:
+                    next_child = walker.GetNextSiblingElement(child)
+                except Exception:
+                    pass
                 if self._element_count >= self._max_elements:
                     break
                 eid = f"{win_id}:{idx}"
@@ -557,11 +745,12 @@ class UiaBackend(Backend):
                             child, app_name, pid, eid,
                             None, max_depth, 0,
                             window_id=win_id,
+                            walker=walker,
                         )
                         if node is not None:
                             elements.append(node)
                     else:
-                        pre = self._check_filter(child)
+                        pre = self._check_filter(child, lightweight=lightweight)
                         if pre is not None:
                             el = _build(
                                 child, app_name, pid, eid,
@@ -572,8 +761,12 @@ class UiaBackend(Backend):
                                 self._element_count += 1
                                 elements.append(el)
                         recurse = max_depth is None or max_depth > 0
+                        _role = pre[0] if pre is not None else None
+                        if recurse and _role is None:
+                            _role = self._translate_role(child)[0]
+                        if recurse and _role in _FLAT_LEAF_ROLES:
+                            recurse = False
                         if recurse and self._skip_subtree_roles is not None:
-                            _role = pre[0] if pre is not None else self._translate_role(child)[0]
                             if _role in self._skip_subtree_roles:
                                 recurse = False
                         if recurse:
@@ -581,17 +774,85 @@ class UiaBackend(Backend):
                                 child, app_name, pid, eid,
                                 elements, max_depth, 1,
                                 window_id=win_id,
+                                walker=walker,
+                                node_role=_role,
                             )
                 except (ValueError, OSError):
                     pass  # stale COM pointer — skip
                 idx += 1
-                try:
-                    child = walker.GetNextSiblingElement(child)
-                except Exception:
-                    break
+                child = next_child
 
         return elements
 
+    def _get_elements_by_control_type(
+        self,
+        roots: list[tuple[Any, str, int, str]],
+        role: Role,
+        *,
+        named_only: bool,
+        lightweight: bool,
+    ) -> list[Element] | None:
+        """Try a direct UIA ControlType search for exact role queries.
+
+        Returns ``None`` when the role can't be expressed as a safe direct
+        ControlType condition, or when the provider doesn't support the
+        search call and we should fall back to the normal tree walk.
+        """
+        control_types = _DIRECT_ROLE_CONTROL_TYPES.get(role)
+        if control_types is None:
+            return None
+
+        try:
+            cond = self._uia.CreatePropertyCondition(30003, control_types[0])
+            for control_type in control_types[1:]:
+                next_cond = self._uia.CreatePropertyCondition(30003, control_type)
+                cond = self._uia.CreateOrCondition(cond, next_cond)
+        except Exception:
+            return None
+
+        elements: list[Element] = []
+        for win_el, app_name, pid, win_id in roots:
+            try:
+                matches = win_el.FindAll(0x4, cond)  # TreeScope_Descendants
+                length = matches.Length
+            except Exception:
+                return None
+
+            for index in range(length):
+                if self._element_count >= self._max_elements:
+                    return elements
+                try:
+                    match = matches.GetElement(index)
+                except Exception:
+                    continue
+
+                pre = self._check_filter(match, lightweight=lightweight)
+                if pre is None:
+                    continue
+                try:
+                    runtime_id = _get_runtime_id(match)
+                except Exception:
+                    runtime_id = str(index)
+                element_id = f"{win_id}:match:{runtime_id}"
+                build = (
+                    self._build_light_element
+                    if lightweight else self._build_element
+                )
+                el = build(
+                    match, app_name, pid, element_id,
+                    window_id=win_id,
+                    _pre=pre,
+                )
+                if el is None:
+                    continue
+                if named_only and not el.name.strip():
+                    continue
+                self._element_count += 1
+                elements.append(el)
+
+        return elements
+
+    @_uia_thread_bound
     def get_element_at(self, x: int, y: int) -> Element | None:
         """Get the element at screen coordinates via UIA.
 
@@ -640,6 +901,7 @@ class UiaBackend(Backend):
         except Exception:
             return None
 
+    @_uia_thread_bound
     def get_element_by_id(self, element_id: str) -> Element | None:
         """Retrieve a single element by its UIA id.
 
@@ -652,13 +914,24 @@ class UiaBackend(Backend):
 
         Returns:
             The :class:`Element` if found, ``None`` otherwise.
+
+        Raises:
+            ValueError: If *element_id* is structurally malformed.
         """
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "uia":
+            raise ValueError(f"Malformed element ID: {element_id!r}")
+        try:
+            pid = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed element ID: {element_id!r}",
+            ) from exc
+
         uia_el = self._resolve_element(element_id)
         if uia_el is None:
             return None
 
-        parts = element_id.split(":")
-        pid = int(parts[1]) if len(parts) > 1 else 0
         app_name = self._resolve_app_name_by_pid(pid)
         win_id = self._extract_window_id(element_id)
 
@@ -675,6 +948,7 @@ class UiaBackend(Backend):
 
     # -- Actions ----------------------------------------------------------
 
+    @_uia_thread_bound
     def do_action(self, element_id: str, action: str) -> bool:
         """Perform an action on an element via UIA patterns.
 
@@ -699,13 +973,7 @@ class UiaBackend(Backend):
             ActionFailedError: If the element is not found or
                 the action is not supported.
         """
-        uia_el = self._resolve_element(element_id)
-        if uia_el is None:
-            raise ActionFailedError(
-                action=action,
-                element_id=element_id,
-                reason="element not found (ID may be malformed or stale)",
-            )
+        uia_el = self._resolve_element_or_raise(element_id, action)
 
         action_lower = action.lower()
 
@@ -819,6 +1087,7 @@ class UiaBackend(Backend):
                    f"available patterns: {available}",
         )
 
+    @_uia_thread_bound
     def set_value(self, element_id: str, value: str, replace: bool) -> bool:
         """Set the text value of an editable element via UIA.
 
@@ -840,13 +1109,7 @@ class UiaBackend(Backend):
             ActionFailedError: If the element doesn't support text
                 editing.
         """
-        uia_el = self._resolve_element(element_id)
-        if uia_el is None:
-            raise ActionFailedError(
-                action="set_value",
-                element_id=element_id,
-                reason="element not found (ID may be malformed or stale)",
-            )
+        uia_el = self._resolve_element_or_raise(element_id, "set_value")
 
         # Try the Value pattern (most common for edit controls).
         pattern = _get_pattern(uia_el, "Value")
@@ -878,6 +1141,7 @@ class UiaBackend(Backend):
             reason="element does not support the Value pattern",
         )
 
+    @_uia_thread_bound
     def set_numeric_value(
         self, element_id: str, value: float,
     ) -> bool:
@@ -897,13 +1161,9 @@ class UiaBackend(Backend):
             ActionFailedError: If the element doesn't support
                 the RangeValue pattern.
         """
-        uia_el = self._resolve_element(element_id)
-        if uia_el is None:
-            raise ActionFailedError(
-                action="set_numeric_value",
-                element_id=element_id,
-                reason="element not found (ID may be malformed or stale)",
-            )
+        uia_el = self._resolve_element_or_raise(
+            element_id, "set_numeric_value",
+        )
 
         pattern = _get_pattern(uia_el, "RangeValue")
         if pattern is not None:
@@ -937,6 +1197,7 @@ class UiaBackend(Backend):
             reason="element does not support RangeValue or Value pattern",
         )
 
+    @_uia_thread_bound
     def focus_element(self, element_id: str) -> bool:
         """Move keyboard focus to an element via UIA.
 
@@ -953,13 +1214,7 @@ class UiaBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 cannot receive focus.
         """
-        uia_el = self._resolve_element(element_id)
-        if uia_el is None:
-            raise ActionFailedError(
-                action="focus",
-                element_id=element_id,
-                reason="element not found (ID may be malformed or stale)",
-            )
+        uia_el = self._resolve_element_or_raise(element_id, "focus")
 
         try:
             uia_el.SetFocus()
@@ -971,26 +1226,319 @@ class UiaBackend(Backend):
                 reason=str(exc),
             ) from exc
 
+    def _get_text_pattern_snapshot(
+        self, uia_el: Any,
+    ) -> tuple[Any | None, Any | None, str | None]:
+        """Return a TextPattern, its document range, and current text.
+
+        UIA providers are inconsistent about which pieces of the Text
+        pattern they expose reliably, so this helper keeps the probing
+        logic in one place for both reading and selection flows.
+        """
+        text_pattern = _get_pattern(uia_el, "Text")
+        if text_pattern is None:
+            return None, None, None
+
+        try:
+            doc_range = text_pattern.DocumentRange
+        except Exception:
+            return text_pattern, None, None
+
+        if doc_range is None:
+            return text_pattern, None, None
+
+        try:
+            text = doc_range.GetText(-1)
+        except Exception:
+            return text_pattern, doc_range, None
+
+        if text is None:
+            return text_pattern, doc_range, None
+
+        return text_pattern, doc_range, str(text)
+
+    @_uia_thread_bound
+    def get_text_content(self, element_id: str) -> str | None:
+        """Return the full text content of an element via UIA.
+
+        Raises:
+            ValueError: If *element_id* is structurally malformed.
+        """
+        # Structural validation up front so malformed IDs raise per the
+        # ABC contract.  ``_resolve_element`` swallows ValueError from
+        # the internal ``int(parts[1])`` parse, which would otherwise
+        # silently conflate malformed input with "not found".
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "uia":
+            raise ValueError(f"Malformed element ID: {element_id!r}")
+        try:
+            int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed element ID: {element_id!r}",
+            ) from exc
+
+        uia_el = self._resolve_element(element_id)
+        if uia_el is None:
+            return None
+
+        # Prefer TextPattern when available. Public tp.select_text()
+        # computes substring offsets from get_text_content(), and the
+        # backend then applies those offsets against DocumentRange.
+        # Using the same UIA text source keeps the offsets aligned.
+        _, _, text = self._get_text_pattern_snapshot(uia_el)
+        if text is not None:
+            return text
+
+        val_pattern = _get_pattern(uia_el, "Value")
+        if val_pattern is not None:
+            try:
+                value = val_pattern.CurrentValue
+                if value is not None:
+                    return str(value)
+            except Exception:
+                pass
+
+        try:
+            name = uia_el.CurrentName
+            if name:
+                return str(name)
+        except Exception:
+            pass
+
+        return None
+
+    @_uia_thread_bound
     def select_text(
         self, element_id: str, start: int, end: int,
     ) -> bool:
         """Select a range of text within an element via UIA.
 
-        TODO: Implement using ``ITextRangeProvider.Select()``
-        via the ``TextPattern``.
+        Uses ``IUIAutomationTextPattern.DocumentRange`` and moves the
+        range endpoints by character offset before calling ``Select()``.
         """
-        raise ActionFailedError(
-            action="select_text",
-            element_id=element_id,
-            reason="select_text not yet implemented for UIA backend",
-        )
+        uia_el = self._resolve_element_or_raise(element_id, "select_text")
 
+        if start < 0 or end < start:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="invalid text range",
+            )
+
+        text_pattern, doc_range, doc_text = self._get_text_pattern_snapshot(uia_el)
+        if text_pattern is None:
+            if self._select_text_win32_edit(uia_el, element_id, start, end):
+                return True
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=(
+                    "element does not support the Text pattern or "
+                    "Win32 Edit selection fallback"
+                ),
+            )
+
+        try:
+            from comtypes.gen.UIAutomationClient import (  # type: ignore[import-not-found]
+                SupportedTextSelection_None,
+                TextPatternRangeEndpoint_End,
+                TextPatternRangeEndpoint_Start,
+                TextUnit_Character,
+            )
+
+            if text_pattern.SupportedTextSelection == SupportedTextSelection_None:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="element text is not selectable",
+                )
+
+            if doc_range is None:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="element returned no document range",
+                )
+
+            # Range selection ultimately moves document endpoints by
+            # character offsets. When UIA also gave us the document
+            # text, reject impossible offsets before we start moving.
+            if doc_text is not None and end > len(doc_text):
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="text range is out of bounds",
+                )
+
+            selection = doc_range.Clone()
+            if selection is None:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="failed to clone document range",
+                )
+
+            # Collapse to the start of the document, then move the
+            # start and end endpoints to the requested offsets.
+            selection.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                selection,
+                TextPatternRangeEndpoint_Start,
+            )
+            moved_start = selection.MoveEndpointByUnit(
+                TextPatternRangeEndpoint_Start,
+                TextUnit_Character,
+                int(start),
+            )
+            selection.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                selection,
+                TextPatternRangeEndpoint_Start,
+            )
+            moved_end = selection.MoveEndpointByUnit(
+                TextPatternRangeEndpoint_End,
+                TextUnit_Character,
+                int(end - start),
+            )
+
+            if moved_start != start or moved_end != (end - start):
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="text range is out of bounds",
+                )
+
+            selection.Select()
+            return True
+        except ActionFailedError:
+            raise
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=str(exc),
+            ) from exc
+
+    @staticmethod
+    def _select_text_win32_edit(
+        uia_el: Any, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select text in a classic Win32 Edit control via ``EM_SETSEL``.
+
+        Native Edit controls commonly expose UIA ValuePattern without
+        TextPattern.  Keep this fallback limited to that provider family
+        and bound the message send so an unresponsive app cannot stall a
+        Touchpoint request indefinitely.
+        """
+        try:
+            if uia_el.CurrentControlType != 50004:
+                return False
+            if str(uia_el.CurrentClassName).strip().lower() != "edit":
+                return False
+        except Exception:
+            return False
+
+        value_pattern = _get_pattern(uia_el, "Value")
+        if value_pattern is not None:
+            try:
+                value = value_pattern.CurrentValue
+                if value is not None and end > len(str(value)):
+                    raise ActionFailedError(
+                        action="select_text",
+                        element_id=element_id,
+                        reason="text range is out of bounds",
+                    )
+            except ActionFailedError:
+                raise
+            except Exception:
+                pass
+
+        hwnd = UiaBackend._get_window_hwnd(uia_el)
+        if not hwnd:
+            return False
+
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            send_message_timeout = ctypes.windll.user32.SendMessageTimeoutW
+            send_message_timeout.argtypes = [
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.UINT,
+                ctypes.wintypes.WPARAM,
+                ctypes.wintypes.LPARAM,
+                ctypes.wintypes.UINT,
+                ctypes.wintypes.UINT,
+                ctypes.POINTER(ctypes.c_size_t),
+            ]
+            send_message_timeout.restype = ctypes.wintypes.LPARAM
+
+            EM_SETSEL = 0x00B1
+            SMTO_ABORTIFHUNG = 0x0002
+            result = ctypes.c_size_t()
+            delivered = send_message_timeout(
+                hwnd,
+                EM_SETSEL,
+                int(start),
+                int(end),
+                SMTO_ABORTIFHUNG,
+                1000,
+                ctypes.byref(result),
+            )
+            if not delivered:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="Win32 Edit selection message timed out or failed",
+                )
+            return True
+        except ActionFailedError:
+            raise
+        except Exception as exc:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=f"Win32 Edit selection fallback failed: {exc}",
+            ) from exc
+
+    def _resolve_window_or_raise(
+        self, window_id: str, action: str,
+    ) -> Any:
+        """Validate + look up a window.  Raises ActionFailedError on either failure.
+
+        Separates the three failure types:
+            - malformed window_id  → ActionFailedError ("malformed ...")
+            - well-formed but no window → ActionFailedError ("not found")
+            - operational failure of the op itself → caller returns False
+        """
+        parts = window_id.split(":")
+        # Window IDs are exactly three parts; the four-part element form
+        # (``uia:<pid>:<runtime_id>:<child_path>``) is rejected here so
+        # it can't accidentally be operated on as a window.
+        if len(parts) != 3 or parts[0] != "uia":
+            raise make_malformed_window_id_error(
+                action, window_id, "uia:<pid>:<runtime_id>",
+            )
+        try:
+            int(parts[1])
+        except ValueError as exc:
+            raise make_malformed_window_id_error(
+                action, window_id, "uia:<pid>:<runtime_id>",
+            ) from exc
+        uia_el = self._resolve_element(window_id)
+        if uia_el is None:
+            raise make_window_not_found_error(action, window_id)
+        return uia_el
+
+    @_uia_thread_bound
     def activate_window(self, window_id: str) -> bool:
         """Bring a window to the foreground via UIA.
 
         Resolves the window element and calls ``SetFocus()``,
         then additionally tries ``SetForegroundWindow()`` via
-        ctypes for maximum reliability.
+        ctypes for maximum reliability.  Restores from minimized
+        when the window is iconic.
 
         Args:
             window_id: The window ID (e.g. ``"uia:1234:win"``).
@@ -998,9 +1546,7 @@ class UiaBackend(Backend):
         Returns:
             ``True`` if the window was activated.
         """
-        uia_el = self._resolve_element(window_id)
-        if uia_el is None:
-            return False
+        uia_el = self._resolve_window_or_raise(window_id, "activate_window")
 
         try:
             uia_el.SetFocus()
@@ -1024,7 +1570,212 @@ class UiaBackend(Backend):
         except Exception:
             return False
 
+    @_uia_thread_bound
+    def minimize_window(self, window_id: str) -> bool:
+        """Minimize a window via UIA / Win32."""
+        uia_el = self._resolve_window_or_raise(window_id, "minimize_window")
+
+        wp = _get_pattern(uia_el, "Window")
+        try:
+            from comtypes.gen.UIAutomationClient import (  # type: ignore[import-not-found]
+                WindowVisualState_Minimized,
+            )
+            if wp is not None:
+                wp.SetWindowVisualState(WindowVisualState_Minimized)
+                return True
+        except Exception:
+            pass
+
+        hwnd = self._get_window_hwnd(uia_el)
+        if not hwnd:
+            return False
+
+        try:
+            import ctypes
+            SW_MINIMIZE = 6
+            ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
+            return True
+        except Exception:
+            return False
+
+    @_uia_thread_bound
+    def fullscreen_window(
+        self, window_id: str, fullscreen: bool = True,
+    ) -> bool:
+        """Map fullscreen requests to maximized/normal window state on Windows."""
+        uia_el = self._resolve_window_or_raise(
+            window_id, "fullscreen_window",
+        )
+
+        wp = _get_pattern(uia_el, "Window")
+        try:
+            from comtypes.gen.UIAutomationClient import (  # type: ignore[import-not-found]
+                WindowVisualState_Maximized,
+                WindowVisualState_Normal,
+            )
+            target = (
+                WindowVisualState_Maximized
+                if fullscreen else WindowVisualState_Normal
+            )
+            if wp is not None:
+                wp.SetWindowVisualState(target)
+                return True
+        except Exception:
+            pass
+
+        hwnd = self._get_window_hwnd(uia_el)
+        if not hwnd:
+            return False
+
+        try:
+            import ctypes
+            SW_MAXIMIZE = 3
+            SW_RESTORE = 9
+            ctypes.windll.user32.ShowWindow(
+                hwnd, SW_MAXIMIZE if fullscreen else SW_RESTORE,
+            )
+            return True
+        except Exception:
+            return False
+
+    @_uia_thread_bound
+    def close_window(self, window_id: str) -> bool:
+        """Close a window via WindowPattern or WM_CLOSE."""
+        uia_el = self._resolve_window_or_raise(window_id, "close_window")
+
+        wp = _get_pattern(uia_el, "Window")
+        if wp is not None:
+            try:
+                wp.Close()
+                return True
+            except Exception:
+                pass
+
+        hwnd = self._get_window_hwnd(uia_el)
+        if not hwnd:
+            return False
+
+        try:
+            import ctypes
+            WM_CLOSE = 0x0010
+            ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            return True
+        except Exception:
+            return False
+
+    @_uia_thread_bound
+    def move_window(self, window_id: str, x: int, y: int) -> bool:
+        """Move a window to ``(x, y)`` via TransformPattern or Win32."""
+        uia_el = self._resolve_window_or_raise(window_id, "move_window")
+
+        self._restore_window_for_geometry(uia_el)
+
+        transform = _get_pattern(uia_el, "Transform")
+        if transform is not None:
+            try:
+                if transform.CurrentCanMove:
+                    transform.Move(float(x), float(y))
+                    return True
+            except Exception:
+                pass
+
+        hwnd = self._get_window_hwnd(uia_el)
+        if not hwnd:
+            return False
+
+        try:
+            import ctypes
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, 0, int(x), int(y), 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            return True
+        except Exception:
+            return False
+
+    @_uia_thread_bound
+    def resize_window(self, window_id: str, width: int, height: int) -> bool:
+        """Resize a window via TransformPattern or Win32.
+
+        Width and height must be positive integers.
+        """
+        if width <= 0 or height <= 0:
+            raise ActionFailedError(
+                action="resize_window",
+                element_id=window_id,
+                reason=(
+                    f"width and height must be positive integers, "
+                    f"got width={width}, height={height}"
+                ),
+            )
+        uia_el = self._resolve_window_or_raise(window_id, "resize_window")
+
+        self._restore_window_for_geometry(uia_el)
+
+        transform = _get_pattern(uia_el, "Transform")
+        if transform is not None:
+            try:
+                if transform.CurrentCanResize:
+                    transform.Resize(float(width), float(height))
+                    return True
+            except Exception:
+                pass
+
+        hwnd = self._get_window_hwnd(uia_el)
+        if not hwnd:
+            return False
+
+        try:
+            import ctypes
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, 0, 0, 0, int(width), int(height),
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            return True
+        except Exception:
+            return False
+
     # -- Private helpers --------------------------------------------------
+
+    @staticmethod
+    def _get_window_hwnd(uia_el: Any) -> int | None:
+        """Return the native HWND for a UIA element, if any."""
+        try:
+            hwnd = uia_el.CurrentNativeWindowHandle
+            if hwnd:
+                return int(hwnd)
+        except Exception:
+            pass
+        return None
+
+    def _restore_window_for_geometry(self, uia_el: Any) -> None:
+        """Best-effort restore before move/resize operations."""
+        wp = _get_pattern(uia_el, "Window")
+        try:
+            from comtypes.gen.UIAutomationClient import (  # type: ignore[import-not-found]
+                WindowVisualState_Normal,
+            )
+            if wp is not None and wp.CurrentWindowVisualState != WindowVisualState_Normal:
+                wp.SetWindowVisualState(WindowVisualState_Normal)
+                return
+        except Exception:
+            pass
+
+        hwnd = self._get_window_hwnd(uia_el)
+        if not hwnd:
+            return
+        try:
+            import ctypes
+            SW_RESTORE = 9
+            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        except Exception:
+            pass
 
     def _get_roots(
         self,
@@ -1078,6 +1829,11 @@ class UiaBackend(Backend):
         child = walker.GetFirstChildElement(self._root)
 
         while child is not None:
+            next_child = None
+            try:
+                next_child = walker.GetNextSiblingElement(child)
+            except Exception:
+                pass
             try:
                 ct = child.CurrentControlType
                 if ct in _UIA_TOPLEVEL_TYPES:
@@ -1087,7 +1843,7 @@ class UiaBackend(Backend):
                         hwnd = None
                     if hwnd:
                         if not _IsWindowVisible(hwnd):
-                            child = walker.GetNextSiblingElement(child)
+                            child = next_child
                             continue
                         # AppBar elements skip the tool/no-activate
                         # filter — they include Taskbar, desktop, and
@@ -1095,14 +1851,14 @@ class UiaBackend(Backend):
                         if ct != 50033:
                             ex = _GetWindowLongW(hwnd, GWL_EXSTYLE)
                             if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) and not (ex & WS_EX_APPWINDOW):
-                                child = walker.GetNextSiblingElement(child)
+                                child = next_child
                                 continue
 
                     pid = child.CurrentProcessId
                     name = self._resolve_app_name(child, pid)
 
                     if app_lower is not None and name.lower() != app_lower:
-                        child = walker.GetNextSiblingElement(child)
+                        child = next_child
                         continue
 
                     runtime_id = _get_runtime_id(child)
@@ -1120,14 +1876,14 @@ class UiaBackend(Backend):
                     except Exception:
                         hwnd = None
                     if not hwnd or not _IsWindowVisible(hwnd):
-                        child = walker.GetNextSiblingElement(child)
+                        child = next_child
                         continue
 
                     pid = child.CurrentProcessId
                     name = self._resolve_app_name(child, pid)
 
                     if app_lower is not None and name.lower() != app_lower:
-                        child = walker.GetNextSiblingElement(child)
+                        child = next_child
                         continue
 
                     runtime_id = _get_runtime_id(child)
@@ -1136,12 +1892,48 @@ class UiaBackend(Backend):
                     roots.append((child, name, pid, wid))
             except Exception:
                 pass
-            try:
-                child = walker.GetNextSiblingElement(child)
-            except Exception:
-                break
+            child = next_child
 
         return roots
+
+    def _validate_element_id(self, element_id: str, action: str) -> None:
+        """Check *element_id* has a well-formed UIA shape.
+
+        Raises:
+            ActionFailedError: If the prefix is wrong or the PID is
+                not a valid integer.  The runtime_id portion is opaque
+                so we don't try to validate its internals — that's
+                up to the tree walk.
+        """
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "uia":
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "uia:<pid>:<runtime_id>[:<child_path>]",
+            )
+        try:
+            int(parts[1])
+        except ValueError as exc:
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "uia:<pid>:<runtime_id>[:<child_path>]",
+            ) from exc
+
+    def _resolve_element_or_raise(
+        self, element_id: str, action: str,
+    ) -> Any:
+        """Validate + look up an element.  Raises ActionFailedError on either failure.
+
+        Separates the three failure types:
+            - malformed element_id → ActionFailedError ("malformed ...")
+            - well-formed but no element → ActionFailedError ("not found")
+            - operational failure of the op itself → caller raises with its own reason
+        """
+        self._validate_element_id(element_id, action)
+        el = self._resolve_element(element_id)
+        if el is None:
+            raise make_element_not_found_error(action, element_id)
+        return el
 
     def _resolve_element(self, element_id: str) -> Any | None:
         """Resolve a UIA element from its touchpoint ID.
@@ -1179,7 +1971,10 @@ class UiaBackend(Backend):
         if len(parts) < 3 or parts[0] != "uia":
             return None
 
-        pid = int(parts[1])
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            return None
         # The "base" runtime ID is parts[2], which may contain dots
         # for the UIA runtime ID array.  Parts beyond index 2 that
         # contain dots are child path components added by get_elements.
@@ -1226,6 +2021,15 @@ class UiaBackend(Backend):
         if remaining.startswith(":"):
             remaining = remaining[1:]
 
+        if remaining.startswith("match:"):
+            runtime_id = remaining[len("match:"):]
+            match = self._find_descendant_by_runtime_id(
+                window_el, runtime_id, walker,
+            )
+            if match is not None:
+                self._runtime_map[element_id] = match
+            return match
+
         child_indices = remaining.split(".")
         current = window_el
 
@@ -1252,6 +2056,36 @@ class UiaBackend(Backend):
         # Cache for future lookups.
         self._runtime_map[element_id] = current
         return current
+
+    @staticmethod
+    def _find_descendant_by_runtime_id(
+        root: Any, runtime_id: str, walker: Any,
+    ) -> Any | None:
+        """Find a cached direct-search match after a thread-session handoff."""
+        pending = [root]
+        examined = 0
+        max_nodes = 10000
+
+        while pending and examined < max_nodes:
+            parent = pending.pop()
+            try:
+                child = walker.GetFirstChildElement(parent)
+            except Exception:
+                continue
+
+            children = []
+            while child is not None and examined < max_nodes:
+                examined += 1
+                if _get_runtime_id(child) == runtime_id:
+                    return child
+                children.append(child)
+                try:
+                    child = walker.GetNextSiblingElement(child)
+                except Exception:
+                    break
+            pending.extend(reversed(children))
+
+        return None
 
     def _build_window(self, uia_el: Any) -> Window | None:
         """Build a :class:`Window` from a UIA element.
@@ -1401,7 +2235,7 @@ class UiaBackend(Backend):
                     pass
         if value is None:
             try:
-                has_rv = uia_el.GetCurrentPropertyValue(30032)  # IsRangeValuePatternAvailable
+                has_rv = uia_el.GetCurrentPropertyValue(30033)  # IsRangeValuePatternAvailable
             except Exception:
                 has_rv = False
             if has_rv:
@@ -1437,6 +2271,15 @@ class UiaBackend(Backend):
                 raw["automation_id"] = auto_id
         except Exception:
             pass
+        aria_role = _get_current_property(uia_el, 30101)
+        if aria_role:
+            raw["aria_role"] = str(aria_role)
+        aria_props = _get_current_property(uia_el, 30102)
+        if aria_props:
+            raw["aria_properties"] = str(aria_props)
+        landmark_type = _get_current_property(uia_el, 30158)
+        if landmark_type:
+            raw["landmark_type"] = str(landmark_type)
         try:
             hwnd = uia_el.CurrentNativeWindowHandle
             if hwnd:
@@ -1470,7 +2313,7 @@ class UiaBackend(Backend):
         )
 
     def _check_filter(
-        self, uia_el: Any,
+        self, uia_el: Any, *, lightweight: bool = False,
     ) -> tuple[Role, str, list["State"]] | None:
         """Check *uia_el* against the active filter hints.
 
@@ -1509,7 +2352,9 @@ class UiaBackend(Backend):
         # No filters active, or element passed — return what we have.
         if role is None:
             role, raw_role = self._translate_role(uia_el)
-        if states is None:
+        if states is None and lightweight:
+            states = []
+        elif states is None:
             states = self._translate_states(uia_el)
         assert raw_role is not None  # guaranteed by _translate_role
         return role, raw_role, states
@@ -1524,6 +2369,8 @@ class UiaBackend(Backend):
         max_depth: int | None = None,
         current_depth: int = 0,
         window_id: str | None = None,
+        walker: Any | None = None,
+        node_role: Role | None = None,
     ) -> None:
         """Recursively collect descendants into a flat list.
 
@@ -1542,15 +2389,26 @@ class UiaBackend(Backend):
         # Safety: stop if we've already reached the element cap.
         if self._element_count >= self._max_elements:
             return
+        if node_role in _FLAT_LEAF_ROLES:
+            return
+        if (self._skip_subtree_roles is not None
+                and node_role in self._skip_subtree_roles):
+            return
 
-        try:
+        if walker is None:
             walker = self._uia.ControlViewWalker
+        try:
             child = walker.GetFirstChildElement(uia_el)
         except Exception:
             return  # parent element is stale or invalid
         idx = 0
 
         while child is not None:
+            next_child = None
+            try:
+                next_child = walker.GetNextSiblingElement(child)
+            except Exception:
+                pass
             if self._element_count >= self._max_elements:
                 break
             child_id = f"{parent_id}.{idx}"
@@ -1568,8 +2426,12 @@ class UiaBackend(Backend):
             except Exception:
                 pass  # stale COM pointer — skip
             recurse = max_depth is None or current_depth < max_depth
+            _role = pre[0] if pre is not None else None
+            if recurse and _role is None:
+                _role = self._translate_role(child)[0]
+            if recurse and _role in _FLAT_LEAF_ROLES:
+                recurse = False
             if recurse and self._skip_subtree_roles is not None:
-                _role = pre[0] if pre is not None else self._translate_role(child)[0]
                 if _role in self._skip_subtree_roles:
                     recurse = False
             if recurse:
@@ -1577,12 +2439,11 @@ class UiaBackend(Backend):
                     child, app_name, pid, child_id, out,
                     max_depth, current_depth + 1,
                     window_id=window_id,
+                    walker=walker,
+                    node_role=_role,
                 )
             idx += 1
-            try:
-                child = walker.GetNextSiblingElement(child)
-            except Exception:
-                break
+            child = next_child
 
     def _to_element_tree(
         self,
@@ -1594,6 +2455,7 @@ class UiaBackend(Backend):
         max_depth: int | None = None,
         current_depth: int = 0,
         window_id: str | None = None,
+        walker: Any | None = None,
     ) -> Element | None:
         """Recursively build an Element with children populated.
 
@@ -1628,30 +2490,34 @@ class UiaBackend(Backend):
                 and element.role in self._skip_subtree_roles):
             return element
 
-        try:
+        if walker is None:
             walker = self._uia.ControlViewWalker
+        try:
             child = walker.GetFirstChildElement(uia_el)
         except Exception:
             return element  # can't enumerate children — return as leaf
         idx = 0
 
         while child is not None:
+            next_child = None
+            try:
+                next_child = walker.GetNextSiblingElement(child)
+            except Exception:
+                pass
             child_id = f"{element_id}.{idx}"
             try:
                 child_el = self._to_element_tree(
                     child, app_name, pid, child_id, element_id,
                     max_depth, current_depth + 1,
                     window_id=window_id,
+                    walker=walker,
                 )
                 if child_el is not None:
                     element.children.append(child_el)
             except Exception:
                 pass  # stale COM pointer — skip
             idx += 1
-            try:
-                child = walker.GetNextSiblingElement(child)
-            except Exception:
-                break
+            child = next_child
 
         return element
 
@@ -1659,6 +2525,7 @@ class UiaBackend(Backend):
     # Lightweight element building (for find() optimisation)
     # -----------------------------------------------------------------
 
+    @_uia_thread_bound
     def inflate_element(self, element: Element) -> Element:
         """Inflate a lightweight element into a fully populated one.
 
@@ -1746,23 +2613,36 @@ class UiaBackend(Backend):
         max_depth: int | None = None,
         current_depth: int = 0,
         window_id: str | None = None,
+        walker: Any | None = None,
+        node_role: Role | None = None,
     ) -> None:
         """Like :meth:`_collect_flat` but builds lightweight elements."""
         if self._element_count >= self._max_elements:
             return
-        try:
+        if node_role in _FLAT_LEAF_ROLES:
+            return
+        if (self._skip_subtree_roles is not None
+                and node_role in self._skip_subtree_roles):
+            return
+        if walker is None:
             walker = self._uia.ControlViewWalker
+        try:
             child = walker.GetFirstChildElement(uia_el)
         except Exception:
             return
         idx = 0
 
         while child is not None:
+            next_child = None
+            try:
+                next_child = walker.GetNextSiblingElement(child)
+            except Exception:
+                pass
             if self._element_count >= self._max_elements:
                 break
             child_id = f"{parent_id}.{idx}"
             try:
-                pre = self._check_filter(child)
+                pre = self._check_filter(child, lightweight=True)
                 if pre is not None:
                     el = self._build_light_element(
                         child, app_name, pid, child_id, parent_id,
@@ -1775,8 +2655,12 @@ class UiaBackend(Backend):
             except Exception:
                 pass
             recurse = max_depth is None or current_depth < max_depth
+            _role = pre[0] if pre is not None else None
+            if recurse and _role is None:
+                _role = self._translate_role(child)[0]
+            if recurse and _role in _FLAT_LEAF_ROLES:
+                recurse = False
             if recurse and self._skip_subtree_roles is not None:
-                _role = pre[0] if pre is not None else self._translate_role(child)[0]
                 if _role in self._skip_subtree_roles:
                     recurse = False
             if recurse:
@@ -1784,47 +2668,55 @@ class UiaBackend(Backend):
                     child, app_name, pid, child_id, out,
                     max_depth, current_depth + 1,
                     window_id=window_id,
+                    walker=walker,
+                    node_role=_role,
                 )
             idx += 1
-            try:
-                child = walker.GetNextSiblingElement(child)
-            except Exception:
-                break
+            child = next_child
 
     @staticmethod
     def _translate_role(uia_el: Any) -> tuple[Role, str]:
-        """Map a UIA element's ControlType to ``(Role, raw_role_string)``.
-
-        Returns:
-            Tuple of (unified Role, raw control type name string).
-        """
+        """Map a UIA element's ControlType to ``(Role, raw_role_string)``."""
         try:
             ct = uia_el.CurrentControlType
             raw = uia_el.CurrentLocalizedControlType or str(ct)
             role = _UIA_ROLE_MAP.get(ct, Role.UNKNOWN)
 
-            # Edit with IsPassword → PASSWORD_TEXT
-            if ct == 50004:  # Edit
+            if ct == 50004:
                 try:
                     if uia_el.CurrentIsPassword:
                         return Role.PASSWORD_TEXT, raw
                 except Exception:
                     pass
 
-            # Button with Toggle pattern → TOGGLE_BUTTON
-            if ct == 50000:  # Button
-                if _get_pattern(uia_el, "Toggle") is not None:
-                    return Role.TOGGLE_BUTTON, raw
+            if ct == 50000 and _get_current_property(uia_el, 30041):
+                role = Role.TOGGLE_BUTTON
 
-            # Window with WindowPattern.IsModal → DIALOG
-            if ct == 50032:  # Window
-                wp = _get_pattern(uia_el, "Window")
-                if wp is not None:
-                    try:
-                        if wp.CurrentIsModal:
-                            return Role.DIALOG, raw
-                    except Exception:
-                        pass
+            if ct == 50032 and _get_current_property(uia_el, 30174):
+                role = Role.DIALOG
+
+            heading_level = _get_current_property(uia_el, 30173)
+            if isinstance(heading_level, int) and heading_level >= 80051:
+                return Role.HEADING, raw
+
+            for aria_role in _get_aria_role_tokens(uia_el):
+                mapped = _UIA_ARIA_ROLE_MAP.get(aria_role)
+                if mapped is not None:
+                    return mapped, raw
+
+            landmark_type = _get_current_property(uia_el, 30157)
+            if isinstance(landmark_type, int):
+                mapped = _UIA_LANDMARK_TYPE_MAP.get(landmark_type)
+                if mapped is not None:
+                    return mapped, raw
+
+            localized_landmark = _get_current_property(uia_el, 30158)
+            if localized_landmark:
+                mapped = _UIA_LOCALIZED_LANDMARK_MAP.get(
+                    str(localized_landmark).strip().lower(),
+                )
+                if mapped is not None:
+                    return mapped, raw
 
             return role, raw
         except Exception:
@@ -1832,20 +2724,15 @@ class UiaBackend(Backend):
 
     @staticmethod
     def _translate_states(uia_el: Any) -> list[State]:
-        """Assemble a list of :class:`State` from UIA element properties.
-
-        UIA doesn't have a state set like AT-SPI2.  Instead, we
-        query individual properties and build the state list.
-        """
+        """Assemble a list of :class:`State` from UIA element properties."""
         states: list[State] = []
+        aria_props = ""
 
         try:
-            # Enabled: the element is interactive and accessible.
             if uia_el.CurrentIsEnabled:
                 states.append(State.ENABLED)
                 states.append(State.SENSITIVE)
 
-            # Offscreen check → VISIBLE / OFFSCREEN.
             try:
                 if uia_el.CurrentIsOffscreen:
                     states.append(State.OFFSCREEN)
@@ -1853,30 +2740,26 @@ class UiaBackend(Backend):
                     states.append(State.VISIBLE)
                     states.append(State.SHOWING)
             except Exception:
-                # If we can't determine offscreen status, assume visible.
                 states.append(State.VISIBLE)
 
-            # Keyboard focusable.
             try:
                 if uia_el.CurrentIsKeyboardFocusable:
                     states.append(State.FOCUSABLE)
             except Exception:
                 pass
 
-            # Currently focused.
             try:
                 if uia_el.CurrentHasKeyboardFocus:
                     states.append(State.FOCUSED)
             except Exception:
                 pass
 
-            # Toggle state (CheckBox, ToggleButton).
             toggle = _get_pattern(uia_el, "Toggle")
             if toggle is not None:
                 try:
                     from comtypes.gen.UIAutomationClient import (  # type: ignore[import-not-found]
-                        ToggleState_On,
                         ToggleState_Indeterminate,
+                        ToggleState_On,
                     )
                     ts = toggle.CurrentToggleState
                     if ts == ToggleState_On:
@@ -1887,7 +2770,6 @@ class UiaBackend(Backend):
                 except Exception:
                     pass
 
-            # Selection state (ListItem, Tab).
             sel = _get_pattern(uia_el, "SelectionItem")
             if sel is not None:
                 try:
@@ -1897,7 +2779,6 @@ class UiaBackend(Backend):
                 except Exception:
                     pass
 
-            # Expand/Collapse state.
             ec = _get_pattern(uia_el, "ExpandCollapse")
             if ec is not None:
                 try:
@@ -1914,7 +2795,6 @@ class UiaBackend(Backend):
                 except Exception:
                     pass
 
-            # Value read-only check.
             val = _get_pattern(uia_el, "Value")
             if val is not None:
                 try:
@@ -1925,23 +2805,19 @@ class UiaBackend(Backend):
                 except Exception:
                     pass
 
-            # MULTI_LINE / SINGLE_LINE for text controls.
             try:
                 ct = uia_el.CurrentControlType
-                if ct == 50004:  # Edit
-                    # Check if the edit supports multi-line via the
-                    # ClassName hint or by trying to scroll vertically.
+                if ct == 50004:
                     cls = uia_el.CurrentClassName or ""
-                    if "RichEdit" in cls or cls == "TextBox":
+                    if _is_multiline_text_control(uia_el, cls):
                         states.append(State.MULTI_LINE)
                     else:
                         states.append(State.SINGLE_LINE)
-                elif ct == 50030:  # Document
+                elif ct == 50030:
                     states.append(State.MULTI_LINE)
             except Exception:
                 pass
 
-            # MODAL — from Window pattern.
             try:
                 wp = _get_pattern(uia_el, "Window")
                 if wp is not None and wp.CurrentIsModal:
@@ -1949,25 +2825,21 @@ class UiaBackend(Backend):
             except Exception:
                 pass
 
-            # REQUIRED — UIA property IsRequiredForForm (30025).
             try:
-                if uia_el.GetCurrentPropertyValue(30025):
+                if _get_current_property(uia_el, 30025):
                     states.append(State.REQUIRED)
             except Exception:
                 pass
 
-            # BUSY — UIA AriaProperties or element-level busy hint.
             try:
-                aria_props = uia_el.GetCurrentPropertyValue(30102)
-                if aria_props and "busy=true" in str(aria_props).lower():
+                aria_props = _get_aria_properties(uia_el)
+                if aria_props and "busy=true" in aria_props:
                     states.append(State.BUSY)
             except Exception:
                 pass
 
-            # ORIENTATION — UIA property Orientation (30023).
-            # 0=None, 1=Horizontal, 2=Vertical.
             try:
-                orient = uia_el.GetCurrentPropertyValue(30023)
+                orient = _get_current_property(uia_el, 30023)
                 if orient == 1:
                     states.append(State.HORIZONTAL)
                 elif orient == 2:
@@ -1975,24 +2847,56 @@ class UiaBackend(Backend):
             except Exception:
                 pass
 
-            # HAS_POPUP — from UIA AriaProperties.
             try:
-                if not aria_props:
-                    aria_props = uia_el.GetCurrentPropertyValue(30102)
-                if aria_props and "haspopup" in str(aria_props).lower():
-                    popup_val = str(aria_props).lower()
-                    if "haspopup=true" in popup_val or "haspopup=menu" in popup_val:
+                if aria_props and "haspopup" in aria_props:
+                    if "haspopup=true" in aria_props or "haspopup=menu" in aria_props:
                         states.append(State.HAS_POPUP)
             except Exception:
                 pass
 
-            # CLICKABLE — inferred from role (consistent with CDP).
             try:
-                ct = uia_el.CurrentControlType
-                role = _UIA_ROLE_MAP.get(ct, Role.UNKNOWN)
-                # Button with Toggle → TOGGLE_BUTTON (clickable)
-                if ct == 50000 and _get_pattern(uia_el, "Toggle") is not None:
-                    role = Role.TOGGLE_BUTTON
+                if (
+                    "invalid=true" in aria_props
+                    or "invalid=grammar" in aria_props
+                    or "invalid=spelling" in aria_props
+                ):
+                    states.append(State.INVALID)
+                else:
+                    is_valid = _get_current_property(
+                        uia_el, 30103, None, ignore_default=True,
+                    )
+                    ct = uia_el.CurrentControlType
+                    if is_valid is False and ct in (50003, 50004, 50015, 50016, 50030):
+                        states.append(State.INVALID)
+            except Exception:
+                pass
+
+            selection = _get_pattern(uia_el, "Selection")
+            if selection is not None:
+                try:
+                    if selection.CurrentCanSelectMultiple:
+                        states.append(State.MULTISELECTABLE)
+                except Exception:
+                    pass
+
+            transform = _get_pattern(uia_el, "Transform")
+            if transform is not None:
+                try:
+                    if transform.CurrentCanResize:
+                        states.append(State.RESIZABLE)
+                except Exception:
+                    pass
+            if State.RESIZABLE not in states:
+                wp = _get_pattern(uia_el, "Window")
+                if wp is not None:
+                    try:
+                        if wp.CurrentCanMaximize:
+                            states.append(State.RESIZABLE)
+                    except Exception:
+                        pass
+
+            try:
+                role, _ = UiaBackend._translate_role(uia_el)
                 if role in _CLICKABLE_ROLES:
                     states.append(State.CLICKABLE)
             except Exception:
@@ -2052,6 +2956,8 @@ class UiaBackend(Backend):
 # Module-level helpers (outside the class for reuse)
 # ---------------------------------------------------------------------------
 
+_uia_com_state = threading.local()
+
 
 def _init_uia() -> tuple:
     """Initialise the UIA COM interface.
@@ -2078,6 +2984,10 @@ def _init_uia() -> tuple:
 
     import comtypes
     import comtypes.client
+
+    if not getattr(_uia_com_state, "initialized", False):
+        comtypes.CoInitialize()
+        _uia_com_state.initialized = True
 
     # Create the UIA COM object.
     # CUIAutomation is the main entry point for UIAutomation.
@@ -2234,6 +3144,7 @@ def _get_runtime_id(uia_el: Any) -> str:
 
 _PATTERN_MAP: dict[str, tuple[int, str]] = {
     "Invoke": (10000, "IUIAutomationInvokePattern"),
+    "Selection": (10001, "IUIAutomationSelectionPattern"),
     "Value": (10002, "IUIAutomationValuePattern"),
     "RangeValue": (10003, "IUIAutomationRangeValuePattern"),
     "Toggle": (10015, "IUIAutomationTogglePattern"),
@@ -2242,6 +3153,7 @@ _PATTERN_MAP: dict[str, tuple[int, str]] = {
     "ScrollItem": (10017, "IUIAutomationScrollItemPattern"),
     "Scroll": (10004, "IUIAutomationScrollPattern"),
     "Window": (10009, "IUIAutomationWindowPattern"),
+    "Text": (10014, "IUIAutomationTextPattern"),
     "Transform": (10016, "IUIAutomationTransformPattern"),
     "Grid": (10006, "IUIAutomationGridPattern"),
     "GridItem": (10007, "IUIAutomationGridItemPattern"),
@@ -2254,10 +3166,10 @@ _PATTERN_MAP: dict[str, tuple[int, str]] = {
 _PATTERN_AVAILABILITY: list[tuple[int, str]] = [
     (30031, "invoke"),              # IsInvokePatternAvailable
     (30043, "set_value"),           # IsValuePatternAvailable
-    (30032, "set_numeric_value"),   # IsRangeValuePatternAvailable
-    (30086, "toggle"),              # IsTogglePatternAvailable
+    (30033, "set_numeric_value"),   # IsRangeValuePatternAvailable
+    (30041, "toggle"),              # IsTogglePatternAvailable
     (30036, "select"),              # IsSelectionItemPatternAvailable
-    (30009, "expand_or_collapse"),  # IsExpandCollapsePatternAvailable
+    (30028, "expand_or_collapse"),  # IsExpandCollapsePatternAvailable
     (30035, "scroll_into_view"),    # IsScrollItemPatternAvailable
 ]
 
@@ -2329,3 +3241,63 @@ def _get_supported_patterns(uia_el: Any) -> list[str]:
             pass
 
     return patterns
+
+
+def _get_current_property(
+    uia_el: Any,
+    prop_id: int,
+    default: Any = None,
+    *,
+    ignore_default: bool = False,
+) -> Any:
+    """Safely read a UIA property value."""
+    try:
+        if ignore_default:
+            value = uia_el.GetCurrentPropertyValueEx(prop_id, True)
+        else:
+            value = uia_el.GetCurrentPropertyValue(prop_id)
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+def _is_multiline_text_control(uia_el: Any, class_name: str) -> bool:
+    """Return whether a UIA text control represents multiline content."""
+    cls = class_name.strip().lower()
+    if "richedit" in cls or cls == "textbox":
+        return True
+    if cls != "edit":
+        return False
+
+    ES_MULTILINE = 0x0004
+    style = _get_win32_window_style(uia_el)
+    return style is not None and bool(style & ES_MULTILINE)
+
+
+def _get_win32_window_style(uia_el: Any) -> int | None:
+    """Return a native control's Win32 style bits when available."""
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        get_window_long = ctypes.windll.user32.GetWindowLongW
+        get_window_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        get_window_long.restype = ctypes.c_long
+        hwnd = uia_el.CurrentNativeWindowHandle
+        return int(get_window_long(hwnd, -16)) if hwnd else None
+    except Exception:
+        return None
+
+
+def _get_aria_role_tokens(uia_el: Any) -> list[str]:
+    """Return lowercase ARIA role tokens for a UIA element."""
+    raw = _get_current_property(uia_el, 30101)
+    if not raw:
+        return []
+    return [tok.strip().lower() for tok in str(raw).split() if tok.strip()]
+
+
+def _get_aria_properties(uia_el: Any) -> str:
+    """Return the element's ARIA properties string, lowercased."""
+    raw = _get_current_property(uia_el, 30102, "")
+    return str(raw).lower() if raw else ""

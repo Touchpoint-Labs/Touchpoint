@@ -222,3 +222,115 @@ class State(str, Enum):
 
     # Link history
     VISITED = "visited"
+
+
+# ---------------------------------------------------------------------------
+# Role classification sets
+# ---------------------------------------------------------------------------
+#
+# Consumers (currently the no-vision MCP snapshot renderer) use these to
+# decide what deserves a line in the tree, what adds context, and what is
+# anonymous scaffolding safe to skip.  Kept as data here so any future
+# filtering logic can reuse the same classification.
+
+INTERACTIVE_ROLES: frozenset[Role] = frozenset({
+    Role.BUTTON,
+    Role.TOGGLE_BUTTON,
+    Role.CHECK_BOX,
+    Role.RADIO_BUTTON,
+    Role.LINK,
+    Role.TEXT_FIELD,
+    Role.PASSWORD_TEXT,
+    Role.COMBO_BOX,
+    Role.SLIDER,
+    Role.SPIN_BUTTON,
+    Role.SWITCH,
+    Role.SPLIT_BUTTON,
+    Role.MENU_ITEM,
+    Role.CHECK_MENU_ITEM,
+    Role.RADIO_MENU_ITEM,
+    Role.TAB,
+    Role.LIST_ITEM,
+    Role.TREE_ITEM,
+    Role.TABLE_CELL,
+    Role.TABLE_ROW,
+    Role.GRID_CELL,
+    # Column/row headers are clickable (sort, select row).
+    Role.TABLE_COLUMN_HEADER,
+    Role.TABLE_ROW_HEADER,
+    # Icons are directly clickable in file managers and launchers.
+    Role.ICON,
+})
+"""Elements an agent can act on directly."""
+
+
+CONTAINER_ROLES: frozenset[Role] = frozenset({
+    Role.DIALOG,
+    Role.ALERT_DIALOG,
+    Role.ALERT,
+    Role.NOTIFICATION,
+    Role.MENU,
+    Role.MENU_BAR,
+    Role.LIST,
+    Role.TREE,
+    Role.TABLE,
+    Role.GRID,
+    Role.FORM,
+    Role.TAB_LIST,
+    Role.TAB_PANEL,
+    Role.NAVIGATION,
+    Role.BANNER,
+    Role.SEARCH,
+    Role.TOOLBAR,
+    Role.STATUS_BAR,
+    Role.HEADER,
+    Role.FOOTER,
+    Role.ARTICLE,
+    Role.TOOLTIP,
+    # Structural context an agent needs to orient itself.
+    Role.HEADING,      # document / page section skeleton
+    Role.LABEL,        # describes adjacent form fields
+    Role.PROGRESS_BAR, # loading / progress state signal
+    Role.LANDMARK,     # generic ARIA landmark (<main>, etc.)
+    Role.CONTENT_INFO, # ARIA contentinfo (<footer role="contentinfo">)
+    Role.LOG,          # live log regions
+    Role.DOCUMENT,     # document body (LibreOffice Writer, word processors)
+    Role.FIGURE,       # <figure> / semantic illustration block
+    Role.TIMER,        # countdown / elapsed-time indicator
+    Role.METER,        # scalar measurement (like progress_bar)
+    Role.NOTE,         # aside / annotation
+    Role.FEED,         # paginated content stream
+})
+"""Semantic containers that add context when preserved in a tree view."""
+
+
+STRUCTURAL_ROLES: frozenset[Role] = frozenset({
+    Role.PANEL,
+    Role.GROUP,
+    Role.SECTION,
+    Role.FRAME,
+    Role.SEPARATOR,
+    Role.SCROLL_BAR,
+    Role.TITLE_BAR,    # window chrome (min/max/close buttons inside)
+    # Opaque visual leaves — shown when named, invisible when unnamed.
+    # INTERACTIVE has no name guard, so decorative unnamed instances
+    # would flood snapshots on image-heavy pages.
+    Role.IMAGE,
+    Role.CANVAS,
+    Role.MATH,
+})
+"""Anonymous wrappers whose children can be reparented during rendering."""
+
+
+# Roles intentionally absent from all three sets above.
+# TEXT and PARAGRAPH are left out because CDP maps sub-word inline nodes
+# (inlineTextBox, lineBreak, <em>, <strong>, <code>, <p>, …) to them,
+# which would flood web-page snapshots if promoted to any visible set.
+# APPLICATION and WINDOW are window roots, handled by windows() not elements().
+_UNCLASSIFIED_ROLES: frozenset[Role] = frozenset({
+    Role.UNKNOWN,
+    Role.APPLICATION,
+    Role.WINDOW,
+    Role.TEXT,
+    Role.PARAGRAPH,
+})

@@ -10,19 +10,123 @@ instead.
 
 Requires:
     - System package: ``libatk-adaptor``, ``at-spi2-core``
-    - Python package: ``PyGObject`` (installed automatically with ``pip install touchpoint-py``)
+    - Python package: ``PyGObject`` (installed automatically with ``pip install touchpoint``)
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
 
-from touchpoint.backends.base import Backend
+from touchpoint.backends.base import (
+    Backend,
+    make_element_not_found_error,
+    make_malformed_element_id_error,
+    make_malformed_window_id_error,
+    make_window_not_found_error,
+)
 from touchpoint.core.element import Element
 from touchpoint.core.exceptions import ActionFailedError
 from touchpoint.core.types import Role, State
 from touchpoint.core.window import Window
 from touchpoint.utils.scale import get_scale_factor
+
+# ---------------------------------------------------------------------------
+# Window-management helpers (EWMH via wmctrl / xdotool)
+# ---------------------------------------------------------------------------
+#
+# AT-SPI itself exposes Component.set_position / set_size on most apps, but
+# minimize / fullscreen / close / activate require talking to the window
+# manager directly.  We use wmctrl as the primary EWMH client with xdotool
+# as a fallback.  Wayland sessions don't support either tool.
+
+_HAS_WMCTRL: bool = shutil.which("wmctrl") is not None
+_HAS_XDOTOOL: bool = shutil.which("xdotool") is not None
+_IS_WAYLAND: bool = (
+    bool(os.environ.get("WAYLAND_DISPLAY"))
+    and not os.environ.get("DISPLAY")
+)
+
+
+def _run_window_tool(cmd: list[str], timeout: float = 1.0) -> bool:
+    """Run a window-management subprocess command.
+
+    Returns True if the command exited 0, False on any failure
+    (non-zero exit, timeout, FileNotFoundError, OSError).
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _wayland_error(action: str, element_id: str) -> ActionFailedError:
+    """Build the standard 'Wayland not supported' error for window mgmt."""
+    return ActionFailedError(
+        action=action,
+        element_id=element_id,
+        reason=(
+            "Wayland sessions are not yet supported for window "
+            "management — requires an X11 session"
+        ),
+    )
+
+
+def _tool_required_error(
+    tool: str, action: str, window_id: str,
+) -> ActionFailedError:
+    """Build a 'specific tool required' error.
+
+    wmctrl is mandatory for every window-management op (the AT-SPI →
+    X11 window-id mapping uses ``wmctrl -lpG``).  xdotool is mandatory
+    additionally for ``minimize_window`` (the only op without a wmctrl
+    path) and is used as a fallback for several others.
+    """
+    return ActionFailedError(
+        action=action,
+        element_id=window_id,
+        reason=(
+            f"{tool} is required for this operation — "
+            f"install it: sudo apt install {tool} "
+            "(or dnf/pacman equivalent)"
+        ),
+    )
+
+
+def _check_wmctrl_or_raise(action: str, window_id: str) -> None:
+    """Raise if Wayland or wmctrl is not installed.
+
+    wmctrl is the mandatory floor for any window-management op because
+    the AT-SPI → X11 window-id mapping depends on ``wmctrl -lpG``.
+    Individual ops layer additional tool requirements on top
+    (e.g. minimize also needs xdotool).
+    """
+    if _IS_WAYLAND:
+        raise _wayland_error(action, window_id)
+    if not _HAS_WMCTRL:
+        raise _tool_required_error("wmctrl", action, window_id)
+
+
+def _title_matches(known: str | None, candidate: str) -> bool:
+    """Compare a known AT-SPI title against a wmctrl candidate title.
+
+    AT-SPI and wmctrl can report titles that differ by a trailing
+    " - AppName" suffix or similar minor asymmetry.  We accept exact
+    matches and either-direction substring matches; bail when we
+    have nothing to compare against.
+    """
+    if not known:
+        return False
+    if known == candidate:
+        return True
+    return known in candidate or candidate in known
 
 # ---------------------------------------------------------------------------
 # Role mapping: AT-SPI2 role names → Touchpoint Role
@@ -122,10 +226,58 @@ _ATSPI_ROLE_MAP: dict[str, Role] = {
     "ROLE_TITLE_BAR": Role.TITLE_BAR,
     # Content types
     "ROLE_ARTICLE": Role.ARTICLE,
+    "ROLE_DEFINITION": Role.SECTION,
     # Toggles & Range (AT-SPI2 ≥ 2.28)
     "ROLE_SWITCH": Role.SWITCH,
     "ROLE_TIMER": Role.TIMER,
     "ROLE_LEVEL_BAR": Role.METER,
+    # Terminals (Konsole, gnome-terminal)
+    "ROLE_TERMINAL": Role.TEXT_FIELD,
+    # Auto-complete dropdowns (Firefox URL bar, GtkEntryCompletion)
+    "ROLE_AUTOCOMPLETE": Role.LIST,
+    # Qt list-box / GTK list-box, distinct from ROLE_LIST
+    "ROLE_LIST_BOX": Role.LIST,
+    # Tree-table (Nautilus list view, file managers)
+    "ROLE_TREE_TABLE": Role.TREE,
+    # <fieldset> / aria-grouped containers
+    "ROLE_GROUPING": Role.GROUP,
+    # Document subtypes (LibreOffice, Thunderbird, Evolution)
+    "ROLE_DOCUMENT_SPREADSHEET": Role.DOCUMENT,
+    "ROLE_DOCUMENT_PRESENTATION": Role.DOCUMENT,
+    "ROLE_DOCUMENT_TEXT": Role.DOCUMENT,
+    "ROLE_DOCUMENT_EMAIL": Role.DOCUMENT,
+    # Info banners (Firefox, Nautilus)
+    "ROLE_INFO_BAR": Role.NOTIFICATION,
+    # Block-level rich text
+    "ROLE_BLOCK_QUOTE": Role.SECTION,
+    # HTML5 media (Firefox / Chromium AT-SPI bridge)
+    "ROLE_AUDIO": Role.GROUP,
+    "ROLE_VIDEO": Role.GROUP,
+    # GTK split-button
+    "ROLE_PUSH_BUTTON_MENU": Role.SPLIT_BUTTON,
+    # Description lists (HTML <dl>/<dt>/<dd>)
+    "ROLE_DESCRIPTION_LIST": Role.LIST,
+    "ROLE_DESCRIPTION_TERM": Role.LIST_ITEM,
+    "ROLE_DESCRIPTION_VALUE": Role.LIST_ITEM,
+    # Comments / annotations (Google Docs, LibreOffice)
+    "ROLE_COMMENT": Role.NOTE,
+    # Date pickers
+    "ROLE_DATE_EDITOR": Role.TEXT_FIELD,
+    # Star ratings (media players, file managers)
+    "ROLE_RATING": Role.SLIDER,
+    # Captions (Firefox <caption>, LibreOffice)
+    "ROLE_CAPTION": Role.LABEL,
+    # Modern document edit roles (Google Docs, LibreOffice 7+)
+    "ROLE_FOOTNOTE": Role.SECTION,
+    "ROLE_MARK": Role.TEXT,
+    "ROLE_SUGGESTION": Role.SECTION,
+    "ROLE_CONTENT_INSERTION": Role.SECTION,
+    "ROLE_CONTENT_DELETION": Role.SECTION,
+    # Multi-page document pages
+    "ROLE_PAGE": Role.SECTION,
+    # Sub/superscript (Firefox/LibreOffice)
+    "ROLE_SUBSCRIPT": Role.TEXT,
+    "ROLE_SUPERSCRIPT": Role.TEXT,
 }
 
 # ---------------------------------------------------------------------------
@@ -181,7 +333,16 @@ _ATSPI_STATE_MAP: dict[str, State] = {
 # window by ``get_windows``.
 # ---------------------------------------------------------------------------
 
-_WINDOW_ROLES: set[str] = {"frame", "window", "dialog", "popup menu"}
+_WINDOW_ROLES: set[str] = {
+    # Standard top-level containers.
+    "frame", "window", "dialog", "popup menu",
+    # GTK / Qt specialised choosers — registered as their own role
+    # rather than ``dialog``, so they need explicit listing or they
+    # silently disappear from ``windows()`` / ``snapshot()``.
+    "file chooser", "color chooser", "font chooser",
+    # Alerts / notifications / IME composition windows.
+    "alert", "notification", "input method window",
+}
 
 
 def _dbus_path_id(acc) -> str:
@@ -614,13 +775,13 @@ class AtSpiBackend(Backend):
                     continue
                 eid = f"{root_element}.{i}"
                 if tree:
-                    elements.append(
-                        self._to_element_tree(
-                            child, app_name, pid, eid,
-                            root_element, max_depth, 0,
-                            window_id=win_id,
-                        )
+                    node = self._to_element_tree(
+                        child, app_name, pid, eid,
+                        root_element, max_depth, 0,
+                        window_id=win_id,
                     )
+                    if node is not None:
+                        elements.append(node)
                 else:
                     pre = self._check_filter(child)
                     if pre is not None:
@@ -667,13 +828,13 @@ class AtSpiBackend(Backend):
                     continue
                 eid = f"{win_id}:{i}"
                 if tree:
-                    elements.append(
-                        self._to_element_tree(
-                            child, app_name, pid, eid,
-                            None, max_depth, 0,
-                            window_id=win_id,
-                        )
+                    node = self._to_element_tree(
+                        child, app_name, pid, eid,
+                        None, max_depth, 0,
+                        window_id=win_id,
                     )
+                    if node is not None:
+                        elements.append(node)
                 else:
                     pre = self._check_filter(child)
                     if pre is not None:
@@ -823,6 +984,21 @@ class AtSpiBackend(Backend):
         return self._build_element(best_node, best_app, best_pid,
                                    element_id, window_id=win_id)
 
+    def _validate_query_id(self, element_id: str) -> None:
+        """Raise ``ValueError`` if *element_id* is structurally malformed.
+
+        Query methods (:meth:`get_element_by_id`, :meth:`get_text_content`)
+        follow the ABC contract of ``ValueError`` on a malformed id and
+        ``None`` on a well-formed-but-absent one — matching the macOS AX
+        and Windows UIA backends. Action methods use the
+        :class:`ActionFailedError`-raising :meth:`_validate_element_id`
+        instead.
+        """
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "atspi":
+            raise ValueError(f"Malformed element ID: {element_id!r}")
+        self._parse_id(element_id)
+
     def get_element_by_id(self, element_id: str) -> Element | None:
         """Retrieve a single element by its AT-SPI2 path id.
 
@@ -835,7 +1011,11 @@ class AtSpiBackend(Backend):
 
         Returns:
             The :class:`Element` if found, ``None`` otherwise.
+
+        Raises:
+            ValueError: If *element_id* is structurally malformed.
         """
+        self._validate_query_id(element_id)
         acc = self._resolve_element(element_id)
         if acc is None:
             return None
@@ -873,13 +1053,7 @@ class AtSpiBackend(Backend):
             ActionFailedError: If the element cannot be found or the
                 action is not supported.
         """
-        acc = self._resolve_element(element_id)
-        if acc is None:
-            raise ActionFailedError(
-                action=action,
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        acc = self._resolve_element_or_raise(element_id, action)
 
         # Find the action by name and invoke it.
         try:
@@ -925,13 +1099,7 @@ class AtSpiBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 does not support text editing.
         """
-        acc = self._resolve_element(element_id)
-        if acc is None:
-            raise ActionFailedError(
-                action="set_value",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        acc = self._resolve_element_or_raise(element_id, "set_value")
 
         Atspi = self._atspi
 
@@ -989,13 +1157,9 @@ class AtSpiBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 does not support the Value interface.
         """
-        acc = self._resolve_element(element_id)
-        if acc is None:
-            raise ActionFailedError(
-                action="set_numeric_value",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        acc = self._resolve_element_or_raise(
+            element_id, "set_numeric_value",
+        )
 
         try:
             iface = acc.get_value_iface()
@@ -1036,13 +1200,7 @@ class AtSpiBackend(Backend):
             ActionFailedError: If the element cannot be found or
                 cannot receive focus.
         """
-        acc = self._resolve_element(element_id)
-        if acc is None:
-            raise ActionFailedError(
-                action="focus",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+        acc = self._resolve_element_or_raise(element_id, "focus")
 
         # Primary: Component.grab_focus() — the standard way.
         try:
@@ -1075,58 +1233,315 @@ class AtSpiBackend(Backend):
                    "(no Component interface and no focus action)",
         )
 
-    def select_text(
-        self, element_id: str, start: int, end: int,
-    ) -> bool:
-        """Select a range of text within an element via AT-SPI2.
+    def get_text_content(self, element_id: str) -> str | None:
+        """Return the full text of an element, recursively if needed.
 
-        Uses the ``Text`` interface's selection methods.  Clears any
-        existing selections first, then adds the requested range.
+        Tries the AT-SPI2 ``Text`` interface on the element first; if
+        absent, walks children recursively.  Leaf nodes without a Text
+        interface fall back to the accessible name.
 
-        Args:
-            element_id: The target element's id.
-            start: Start offset (0-based character index).
-            end: End offset (exclusive).
-
-        Returns:
-            ``True`` if the selection was applied.
+        Returns ``""`` for an accessible but empty element, ``None`` when
+        no text interface or accessible name is reachable at all.
 
         Raises:
-            ActionFailedError: If the element does not implement the
-                Text interface or the selection fails.
+            ValueError: If *element_id* is structurally malformed.
         """
+        self._validate_query_id(element_id)
+        Atspi = self._atspi
         acc = self._resolve_element(element_id)
         if acc is None:
-            raise ActionFailedError(
-                action="select_text",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+            return None
+        parts: list[str] = []
+        self._collect_text_recursive(Atspi, acc, parts, depth=0)
+        if not parts:
+            return None
+        return "\n".join(p for p in parts if p)
 
-        Atspi = self._atspi
+    def _collect_text_recursive(
+        self,
+        Atspi: object,
+        acc: object,
+        out: list[str],
+        depth: int,
+        max_depth: int = 20,
+    ) -> None:
+        """Walk *acc* depth-first, appending text segments to *out*.
 
-        # Check for the Text interface.
+        When an element exposes the AT-SPI Text interface it is treated as a
+        content leaf: its text is collected and recursion stops.  Children of
+        such elements are implementation detail (search bars, scroll overlays,
+        etc.) and must not contribute to the output.
+
+        For container elements without a Text interface the walk recurses into
+        children.  True leaf nodes without a Text interface fall back to the
+        accessible name (covers list items, labels, buttons, etc.).
+        """
+        if depth > max_depth:
+            return
         try:
-            text_iface = acc.get_text_iface()
+            ifaces = acc.get_interfaces()
         except Exception:
-            text_iface = None
+            return
+        if "Text" in ifaces:
+            try:
+                count = acc.get_character_count()
+                if count > 0:
+                    # Use the explicit class method — the instance method
+                    # is shadowed by Accessible.get_text in newer PyGObject
+                    # and silently returns None.
+                    text = Atspi.Text.get_text(acc, 0, count)
+                    out.append(text if text else "")
+                else:
+                    # Accessible but empty — append "" so the caller can
+                    # distinguish "empty element" (parts=[""]) from
+                    # "no text reachable at all" (parts=[]).
+                    out.append("")
+            except Exception:
+                pass
+            # Stop here: children of a Text node are UI chrome, not content.
+            return
 
-        if text_iface is None:
+        try:
+            child_count = min(
+                acc.get_child_count(), self._MAX_CHILDREN_PER_NODE,
+            )
+        except Exception:
+            child_count = 0
+
+        if child_count > 0:
+            try:
+                for i in range(child_count):
+                    child = acc.get_child_at_index(i)
+                    if child is not None:
+                        self._collect_text_recursive(
+                            Atspi, child, out, depth + 1, max_depth,
+                        )
+            except Exception:
+                pass
+        else:
+            # Leaf node with no Text interface — use the accessible name
+            # as a fallback (covers list items, labels, buttons, etc. whose
+            # text lives in the name attribute rather than a Text interface).
+            try:
+                name = acc.get_name()
+                if name and name.strip():
+                    out.append(name)
+            except Exception:
+                pass
+
+    def _build_text_offset_map(
+        self,
+        Atspi: object,
+        acc: object,
+        out: "list[tuple[object, int, int, bool]]",
+        g_offset: "list[int]",
+        depth: int = 0,
+        max_depth: int = 20,
+    ) -> None:
+        """Walk *acc* depth-first, building a list of (acc, global_start, global_end, selectable).
+
+        Mirrors _collect_text_recursive exactly — same traversal order, same
+        stop-at-Text-interface rule, same leaf-name-fallback, same
+        _MAX_CHILDREN_PER_NODE cap — so the global offsets correspond to
+        positions in the string returned by get_text_content() (non-empty
+        parts joined with '\\n').
+
+        The ``selectable`` flag is True only for Text-interface nodes that
+        support add_selection().  Name-fallback leaf entries are recorded with
+        selectable=False so _find_text_node_for_offset can raise a clear error
+        rather than silently mapping into the wrong text node.
+        """
+        if depth > max_depth:
+            return
+        try:
+            ifaces = acc.get_interfaces()
+        except Exception:
+            return
+
+        if "Text" in ifaces:
+            try:
+                count = acc.get_character_count()
+                if count > 0:
+                    text = Atspi.Text.get_text(acc, 0, count)
+                    if text:
+                        if out:  # '\n' separator between parts (mirrors "\n".join)
+                            g_offset[0] += 1
+                        g_start = g_offset[0]
+                        g_offset[0] += len(text)
+                        out.append((acc, g_start, g_offset[0], True))
+            except Exception:
+                pass
+            return  # Text node is a leaf — stop recursing
+
+        try:
+            child_count = min(
+                acc.get_child_count(), self._MAX_CHILDREN_PER_NODE,
+            )
+        except Exception:
+            child_count = 0
+
+        if child_count > 0:
+            try:
+                for i in range(child_count):
+                    child = acc.get_child_at_index(i)
+                    if child is not None:
+                        self._build_text_offset_map(
+                            Atspi, child, out, g_offset, depth + 1, max_depth,
+                        )
+            except Exception:
+                pass
+        else:
+            # Leaf node with no Text interface — name fallback (mirrors
+            # _collect_text_recursive).  Record as non-selectable so
+            # _find_text_node_for_offset can produce a clear error.
+            try:
+                name = acc.get_name()
+                if name and name.strip():
+                    if out:
+                        g_offset[0] += 1
+                    g_start = g_offset[0]
+                    g_offset[0] += len(name)
+                    out.append((acc, g_start, g_offset[0], False))
+            except Exception:
+                pass
+
+    def _find_text_node_for_offset(
+        self,
+        Atspi: object,
+        acc: object,
+        start: int,
+        end: int,
+        element_id: str,
+    ) -> "tuple[object, int, int]":
+        """Locate the descendant text node covering [start, end).
+
+        Walks *acc* with _build_text_offset_map to recover the same offset
+        space as get_text_content(), then maps the requested range to the
+        single selectable text node that contains it.
+
+        Returns:
+            (node_acc, local_start, local_end) ready to pass to
+            Text.add_selection().
+
+        Raises:
+            ActionFailedError: If no text nodes exist, the range is out of
+                bounds, the range spans more than one text node, or the
+                matched node is a name-fallback leaf (not selectable).
+        """
+        out: list[tuple[object, int, int, bool]] = []
+        self._build_text_offset_map(Atspi, acc, out, [0])
+        if not out:
             raise ActionFailedError(
                 action="select_text",
                 element_id=element_id,
                 reason="element does not support the Text interface",
             )
 
+        if start == end:
+            entry = next((e for e in out if e[1] <= start <= e[2]), None)
+            if entry is None:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason=f"cursor position {start} is out of bounds",
+                )
+            node_acc, g_start, _, selectable = entry
+            if not selectable:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="text segment does not support selection",
+                )
+            local = start - g_start
+            return (node_acc, local, local)
+
+        start_entry = next((e for e in out if e[1] <= start < e[2]), None)
+        end_entry = next((e for e in out if e[1] < end <= e[2]), None)
+
+        if start_entry is None or end_entry is None:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=f"text range [{start}, {end}) is out of bounds",
+            )
+
+        if start_entry[0] is not end_entry[0]:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason=(
+                    "selection spans multiple text segments; "
+                    "narrow the selection to a single paragraph"
+                ),
+            )
+
+        node_acc, g_start, _, selectable = start_entry
+        if not selectable:
+            raise ActionFailedError(
+                action="select_text",
+                element_id=element_id,
+                reason="text segment does not support selection",
+            )
+        return (node_acc, start - g_start, end - g_start)
+
+    def select_text(
+        self, element_id: str, start: int, end: int,
+    ) -> bool:
+        """Select a range of text within an element via AT-SPI2.
+
+        Uses the ``Text`` interface's selection methods.  Clears any
+        existing selections first, then adds the requested selection.
+
+        If the element itself lacks the Text interface (e.g. a document
+        container whose content lives in per-paragraph child nodes),
+        the method walks the subtree with _find_text_node_for_offset to
+        locate the correct text node and re-maps the offsets.  Raises
+        ActionFailedError if the range spans more than one text node.
+
+        Args:
+            element_id: The target element's id.
+            start: Start offset (0-based character index in the string
+                returned by get_text_content()).
+            end: End offset (exclusive).
+
+        Returns:
+            ``True`` if the selection was applied.
+
+        Raises:
+            ActionFailedError: If the element has no accessible text,
+                the range is out of bounds, the range spans multiple
+                text nodes, or the selection fails.
+        """
+        acc = self._resolve_element_or_raise(element_id, "select_text")
+
+        Atspi = self._atspi
+
         try:
-            # Clear existing selections.
+            text_iface = acc.get_text_iface()
+        except Exception:
+            text_iface = None
+
+        if text_iface is None:
+            # Element lacks Text interface — locate the right descendant
+            # text node using the same offset space as get_text_content().
+            acc, start, end = self._find_text_node_for_offset(
+                Atspi, acc, start, end, element_id,
+            )
+
+        try:
             n_sel = Atspi.Text.get_n_selections(acc)
             for i in range(n_sel - 1, -1, -1):
                 Atspi.Text.remove_selection(acc, i)
-
-            # Add the requested selection.
             result = Atspi.Text.add_selection(acc, start, end)
-            return bool(result)
+            if not result:
+                raise ActionFailedError(
+                    action="select_text",
+                    element_id=element_id,
+                    reason="selection failed (element may have become unavailable)",
+                )
+            return True
+        except ActionFailedError:
+            raise
         except Exception as exc:
             raise ActionFailedError(
                 action="select_text",
@@ -1135,54 +1550,273 @@ class AtSpiBackend(Backend):
             ) from exc
 
     def activate_window(self, window_id: str) -> bool:
-        """Bring a window to the foreground via AT-SPI2.
+        """Bring a window to the foreground.
 
-        Resolves the window's accessible from *window_id*, then
-        tries an ``activate`` / ``raise`` action.  Falls back to
-        ``Component.grab_focus()`` if no action is available.
-
-        Args:
-            window_id: Format ``"atspi:{pid}:{dbus_path_id}"``.
-
-        Returns:
-            ``True`` if the window was activated.
+        Uses wmctrl first because it sends ``_NET_ACTIVE_WINDOW`` with
+        pager source — most DEs honour pager sources even with focus-
+        stealing prevention on (xdotool's "application" source can get
+        blocked).  Falls back to xdotool, then a last-ditch AT-SPI
+        ``grab_focus`` (occasionally propagates to window activation on
+        GTK).
         """
+        self._validate_window_id_or_raise(window_id, "activate_window")
+        _check_wmctrl_or_raise("activate_window", window_id)
+        x11_id = self._x11_id_or_raise(window_id, "activate_window")
+
+        if _HAS_WMCTRL and _run_window_tool(["wmctrl", "-ia", x11_id]):
+            return True
+        if _HAS_XDOTOOL and _run_window_tool(
+            ["xdotool", "windowactivate", x11_id],
+        ):
+            return True
+
+        # Last resort: AT-SPI grab_focus on the window frame.
         parts = self._parse_id(window_id)
-        if len(parts) < 3:
-            return False
+        try:
+            result = self._find_window_accessible(
+                int(parts[1]), parts[2],
+            )
+        except Exception:
+            result = None
+        if result is not None:
+            try:
+                comp = result[0].get_component_iface()
+                if comp is not None and comp.grab_focus():
+                    return True
+            except Exception:
+                pass
+        return False
 
-        result = self._find_window_accessible(
-            int(parts[1]), parts[2],
+    def minimize_window(self, window_id: str) -> bool:
+        """Minimize a window.
+
+        Uses xdotool's ``windowminimize`` (sends
+        ``WM_CHANGE_STATE IconicState`` — the ICCCM-standard iconify
+        request).  wmctrl has no real minimize path:
+        ``_NET_WM_STATE_HIDDEN`` is read-only per the EWMH spec
+        (set by the WM, not by clients), so ``wmctrl -b add,hidden``
+        succeeds without actually minimizing on spec-compliant WMs.
+
+        Use :meth:`activate_window` to restore.
+        """
+        self._validate_window_id_or_raise(window_id, "minimize_window")
+        # wmctrl is the floor (needed for id mapping); xdotool is the
+        # one tool that can actually perform the minimize.
+        _check_wmctrl_or_raise("minimize_window", window_id)
+        if not _HAS_XDOTOOL:
+            raise _tool_required_error(
+                "xdotool", "minimize_window", window_id,
+            )
+        x11_id = self._x11_id_or_raise(window_id, "minimize_window")
+        return _run_window_tool(["xdotool", "windowminimize", x11_id])
+
+    def fullscreen_window(
+        self, window_id: str, fullscreen: bool = True,
+    ) -> bool:
+        """Enter or exit fullscreen via EWMH ``_NET_WM_STATE_FULLSCREEN``.
+
+        wmctrl only — xdotool has no direct fullscreen toggle.
+        """
+        self._validate_window_id_or_raise(window_id, "fullscreen_window")
+        # wmctrl is the only tool that can do this; _check_wmctrl_or_raise
+        # also covers the Wayland and missing-wmctrl cases uniformly.
+        _check_wmctrl_or_raise("fullscreen_window", window_id)
+        x11_id = self._x11_id_or_raise(window_id, "fullscreen_window")
+        op = "add,fullscreen" if fullscreen else "remove,fullscreen"
+        return _run_window_tool(
+            ["wmctrl", "-i", "-r", x11_id, "-b", op],
         )
-        if result is None:
-            return False
-        win_node = result[0]
 
-        # Try activation-related actions on the window accessible.
-        _activate_names = {"activate", "raise", "focus"}
-        try:
-            n_actions = win_node.get_n_actions()
-            for i in range(n_actions):
-                if win_node.get_action_name(i).lower() in _activate_names:
-                    try:
-                        win_node.do_action(i)
-                        return True
-                    except Exception:
-                        return True  # dispatched despite D-Bus timeout
-        except Exception:
-            pass
+    def close_window(self, window_id: str) -> bool:
+        """Politely close a window via EWMH ``_NET_CLOSE_WINDOW``.
 
-        # Fallback: Component.grab_focus().
-        try:
-            comp = win_node.get_component_iface()
-            if comp is not None and comp.grab_focus():
-                return True
-        except Exception:
-            pass
+        The window manager forwards the request to the app, which may
+        prompt the user (e.g. unsaved changes).  Not a force-kill.
+        """
+        self._validate_window_id_or_raise(window_id, "close_window")
+        _check_wmctrl_or_raise("close_window", window_id)
+        x11_id = self._x11_id_or_raise(window_id, "close_window")
+        if _HAS_WMCTRL and _run_window_tool(["wmctrl", "-i", "-c", x11_id]):
+            return True
+        if _HAS_XDOTOOL and _run_window_tool(
+            ["xdotool", "windowclose", x11_id],
+        ):
+            return True
+        return False
 
+    def move_window(self, window_id: str, x: int, y: int) -> bool:
+        """Move a window so its top-left corner is at ``(x, y)``.
+
+        Coordinates are absolute X11 screen pixels (primary monitor
+        origin is ``0,0``; negative or out-of-range coordinates
+        reach secondary monitors).  Note: wmctrl interprets ``-1``
+        in either axis as "leave unchanged"; this method clamps an
+        exact ``-1`` to ``-2`` so the move always applies.
+
+        Uses wmctrl's ``_NET_MOVERESIZE_WINDOW``; falls back to
+        xdotool (note: xdotool's ``windowmove`` positions the
+        client window, not the frame, so results can be off by the
+        ``_NET_FRAME_EXTENTS`` on reparenting WMs).
+
+        AT-SPI ``Component.set_position`` is intentionally not used —
+        GTK/Qt accessibility bridges no-op on top-level windows.
+        """
+        self._validate_window_id_or_raise(window_id, "move_window")
+        # wmctrl reads -1 as "no change" for either axis.  Clamp.
+        if x == -1:
+            x = -2
+        if y == -1:
+            y = -2
+        _check_wmctrl_or_raise("move_window", window_id)
+        x11_id = self._x11_id_or_raise(window_id, "move_window")
+        if _HAS_WMCTRL and _run_window_tool(
+            ["wmctrl", "-i", "-r", x11_id, "-e",
+             f"0,{x},{y},-1,-1"],
+        ):
+            return True
+        if _HAS_XDOTOOL and _run_window_tool(
+            ["xdotool", "windowmove", x11_id, str(x), str(y)],
+        ):
+            return True
+        return False
+
+    def resize_window(
+        self, window_id: str, width: int, height: int,
+    ) -> bool:
+        """Resize a window to ``width`` x ``height`` pixels.
+
+        Width and height must be positive integers.
+
+        Uses wmctrl's ``_NET_MOVERESIZE_WINDOW``; falls back to
+        xdotool ``windowsize``.
+
+        AT-SPI ``Component.set_size`` is intentionally not used —
+        GTK and Qt bridges no-op for top-level resize (they return
+        ``True`` without effect).  Apps with ``WM_NORMAL_HINTS`` size
+        increments (terminals, etc.) may snap to the nearest valid
+        size.
+        """
+        self._validate_window_id_or_raise(window_id, "resize_window")
+        if width <= 0 or height <= 0:
+            raise ActionFailedError(
+                action="resize_window",
+                element_id=window_id,
+                reason=(
+                    f"width and height must be positive integers, "
+                    f"got width={width}, height={height}"
+                ),
+            )
+        _check_wmctrl_or_raise("resize_window", window_id)
+        x11_id = self._x11_id_or_raise(window_id, "resize_window")
+        if _HAS_WMCTRL and _run_window_tool(
+            ["wmctrl", "-i", "-r", x11_id, "-e",
+             f"0,-1,-1,{width},{height}"],
+        ):
+            return True
+        if _HAS_XDOTOOL and _run_window_tool(
+            ["xdotool", "windowsize", x11_id, str(width), str(height)],
+        ):
+            return True
         return False
 
     # -- Private helpers --------------------------------------------------
+
+    def _validate_window_id_or_raise(
+        self, window_id: str, action: str,
+    ) -> None:
+        """Raise :class:`ActionFailedError` if *window_id* is malformed.
+
+        Window IDs are exactly three colon-separated parts; the four-part
+        ``atspi:<pid>:<token>:<child_path>`` form is an *element* id,
+        which is rejected here so it can't accidentally be operated on
+        as a window.
+        """
+        try:
+            parts = self._parse_id(window_id)
+        except ValueError as exc:
+            raise make_malformed_window_id_error(
+                action, window_id, "atspi:<pid>:<token>",
+            ) from exc
+        if len(parts) != 3 or parts[0] != "atspi":
+            raise make_malformed_window_id_error(
+                action, window_id, "atspi:<pid>:<token>",
+            )
+
+    def _x11_id_or_raise(self, window_id: str, action: str) -> str:
+        """Return the X11 window ID for *window_id*, or raise not-found."""
+        x11_id = self._atspi_to_x11_window_id(window_id)
+        if x11_id is None:
+            raise make_window_not_found_error(action, window_id)
+        return x11_id
+
+    def _atspi_to_x11_window_id(self, window_id: str) -> str | None:
+        """Map an AT-SPI window ID to its X11 hex window ID.
+
+        Uses ``wmctrl -lpG`` and matches by PID + window title.  Returns
+        ``None`` if the window cannot be located, or multiple windows
+        share the PID and the title cannot disambiguate them.  Callers
+        are responsible for ensuring wmctrl is installed first
+        (see :func:`_check_wmctrl_or_raise`); if it isn't, the
+        underlying ``subprocess.run`` raises ``FileNotFoundError``
+        which is swallowed and returns ``None``.
+        """
+        parts = self._parse_id(window_id)
+        if len(parts) < 3:
+            return None
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            return None
+
+        win_title: str | None = None
+        try:
+            result = self._find_window_accessible(pid, parts[2])
+            if result is not None:
+                win_title = result[0].get_name() or None
+        except Exception:
+            pass
+
+        try:
+            out = subprocess.run(
+                ["wmctrl", "-lpG"],
+                capture_output=True,
+                timeout=1.0,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+        if out.returncode != 0:
+            return None
+
+        text = out.stdout.decode(errors="replace")
+        matches: list[tuple[str, str]] = []
+        for line in text.splitlines():
+            fields = line.split(None, 8)
+            # Format: hex_id desktop pid x y w h host title
+            if len(fields) < 9:
+                continue
+            try:
+                line_pid = int(fields[2])
+            except ValueError:
+                continue
+            if line_pid != pid:
+                continue
+            matches.append((fields[0], fields[8]))
+
+        if not matches:
+            return None
+        if len(matches) == 1:
+            # Single PID match — trust it (matches the common case where
+            # AT-SPI and wmctrl agree on one window for the process).
+            return matches[0][0]
+        # Multiple windows same PID — disambiguate by title.  AT-SPI and
+        # wmctrl may report slightly different titles (e.g. one strips
+        # " - AppName"); see _title_matches for the relaxed rule.
+        if win_title:
+            for hex_id, line_title in matches:
+                if _title_matches(win_title, line_title):
+                    return hex_id
+        return None
 
     def _parse_id(self, id_str: str) -> list[str]:
         """Validate and split an AT-SPI2 element / window ID.
@@ -1190,26 +1824,32 @@ class AtSpiBackend(Backend):
         ID format:
             ``"atspi:{pid}:{dbus_path_id}"`` for windows, or
             ``"atspi:{pid}:{dbus_path_id}:{child.path}"`` for
-            elements.  *pid* is the OS process ID and
-            *dbus_path_id* is the numeric suffix from the window
-            accessible's D-Bus object path.
+            elements.  *pid* is the OS process ID. *dbus_path_id* is
+            the trailing segment of the accessible's D-Bus object path:
+            an integer on most toolkits (GTK3, Qt), but a UUID-style
+            string on GTK4 apps (e.g. gnome-calculator), whose paths
+            look like ``/org/<app>/a11y/135d3278_0e7f_4d4a_...``. It is
+            string-matched during resolution, so it need not be numeric.
 
         Returns:
             The colon-split parts list (e.g.
             ``['atspi', '2269', '1', '2.1.0']``).
 
         Raises:
-            ValueError: If any numeric component is not a valid integer.
+            ValueError: If the PID or a child-path index is not a valid
+                integer.
         """
         parts = id_str.split(":")
-        for idx in (1, 2):
-            if idx < len(parts):
-                try:
-                    int(parts[idx])
-                except ValueError:
-                    raise ValueError(
-                        f"Malformed element ID: {id_str!r}"
-                    ) from None
+        # Only the PID must be numeric. The D-Bus path suffix (parts[2])
+        # may be a non-numeric UUID on GTK4 apps; resolution compares it
+        # as a string, so do not reject it here.
+        if len(parts) > 1:
+            try:
+                int(parts[1])
+            except ValueError:
+                raise ValueError(
+                    f"Malformed element ID: {id_str!r}"
+                ) from None
         if len(parts) >= 4 and parts[3]:
             for seg in parts[3].split("."):
                 try:
@@ -1326,6 +1966,48 @@ class AtSpiBackend(Backend):
         # (e.g. a dialog opening).  Only hits are cached.
         return None
 
+    def _validate_element_id(self, element_id: str, action: str) -> None:
+        """Check *element_id* has a well-formed AT-SPI2 shape.
+
+        Wraps :meth:`_parse_id` (which raises ``ValueError`` on bad
+        numeric components) and additionally checks the prefix and
+        minimum part count.
+
+        Raises:
+            ActionFailedError: If the prefix is wrong, the PID is
+                non-integer, the dbus_path is non-integer, or any
+                child-path segment is non-integer.
+        """
+        parts = element_id.split(":")
+        if len(parts) < 3 or parts[0] != "atspi":
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "atspi:<pid>:<dbus_path_id>[:<child_path>]",
+            )
+        try:
+            self._parse_id(element_id)
+        except ValueError as exc:
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "atspi:<pid>:<dbus_path_id>[:<child_path>]",
+            ) from exc
+
+    def _resolve_element_or_raise(
+        self, element_id: str, action: str,
+    ):
+        """Validate + look up an element.  Raises ActionFailedError on either failure.
+
+        Separates the three failure types:
+            - malformed element_id → ActionFailedError ("malformed ...")
+            - well-formed but no element → ActionFailedError ("not found")
+            - operational failure of the op itself → caller raises with its own reason
+        """
+        self._validate_element_id(element_id, action)
+        acc = self._resolve_element(element_id)
+        if acc is None:
+            raise make_element_not_found_error(action, element_id)
+        return acc
+
     def _resolve_element(self, element_id: str):
         """Navigate the AT-SPI2 tree to the accessible at *element_id*.
 
@@ -1433,8 +2115,10 @@ class AtSpiBackend(Backend):
             states = self._translate_states(acc.get_state_set())
         assert raw_role is not None  # guaranteed by _translate_role
 
-        # Final sanity check: if the element isn't showing, skip it.
-        if State.SHOWING not in states:
+        # Defunct elements are stale references whose underlying object
+        # no longer exists.  Skip unconditionally — acting on them always
+        # fails, and they appear after the SHOWING filter was removed.
+        if State.DEFUNCT in states:
             return None
 
         # Fetch name now (if not already fetched by named_only filter)
@@ -1751,7 +2435,7 @@ class AtSpiBackend(Backend):
         max_depth: int | None = None,
         current_depth: int = 0,
         window_id: str | None = None,
-    ) -> Element:
+    ) -> "Element | None":
         """Recursively build an Element with children populated.
 
         Args:
@@ -1760,6 +2444,19 @@ class AtSpiBackend(Backend):
             current_depth: How deep we are from the starting point.
             window_id: The window id to attach to every element.
         """
+        # Skip defunct elements in tree walks just as _check_filter does
+        # in flat walks — defunct objects are stale references whose
+        # underlying accessible no longer exists.  Use the raw AT-SPI
+        # state-set check to avoid a redundant full translation pass
+        # (build_element will translate states again for the Element).
+        try:
+            if acc.get_state_set().contains(
+                self._atspi.StateType.DEFUNCT
+            ):
+                return None
+        except Exception:
+            return None  # element so stale that state_set call threw
+
         element = self._build_element(
             acc, app_name, pid, element_id, parent_id,
             window_id=window_id,
@@ -1783,13 +2480,13 @@ class AtSpiBackend(Backend):
             if child is None:
                 continue
             child_id = f"{element_id}.{i}"
-            element.children.append(
-                self._to_element_tree(
-                    child, app_name, pid, child_id, element_id,
-                    max_depth, current_depth + 1,
-                    window_id=window_id,
-                )
+            child_el = self._to_element_tree(
+                child, app_name, pid, child_id, element_id,
+                max_depth, current_depth + 1,
+                window_id=window_id,
             )
+            if child_el is not None:
+                element.children.append(child_el)
         return element
 
 

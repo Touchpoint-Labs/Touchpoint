@@ -14,7 +14,7 @@ Auto-discovers CDP ports by scanning process command lines for
 ``Get-CimInstance`` on Windows), or uses explicit registration via
 ``tp.configure(cdp_ports={"Slack": 9222})``.
 
-Dependencies: ``websocket-client`` (installed automatically with ``pip install touchpoint-py``).
+Dependencies: ``websocket-client`` (installed automatically with ``pip install touchpoint``).
 """
 
 from __future__ import annotations
@@ -30,7 +30,11 @@ import sys
 import urllib.request
 from typing import Any
 
-from touchpoint.backends.base import Backend
+from touchpoint.backends.base import (
+    Backend,
+    make_element_not_found_error,
+    make_malformed_element_id_error,
+)
 from touchpoint.core.element import Element
 from touchpoint.core.exceptions import ActionFailedError
 from touchpoint.core.types import Role, State
@@ -283,10 +287,13 @@ _INPUT_TYPE_ROLE: dict[str, Role] = {
     "button": Role.BUTTON,
     "checkbox": Role.CHECK_BOX,
     "color": Role.BUTTON,
+    "date": Role.TEXT_FIELD,
+    "datetime-local": Role.TEXT_FIELD,
     "email": Role.TEXT_FIELD,
     "file": Role.BUTTON,
     "hidden": Role.UNKNOWN,
     "image": Role.BUTTON,
+    "month": Role.TEXT_FIELD,
     "number": Role.SPIN_BUTTON,
     "password": Role.PASSWORD_TEXT,
     "radio": Role.RADIO_BUTTON,
@@ -296,37 +303,51 @@ _INPUT_TYPE_ROLE: dict[str, Role] = {
     "submit": Role.BUTTON,
     "tel": Role.TEXT_FIELD,
     "text": Role.TEXT_FIELD,
+    "time": Role.TEXT_FIELD,
     "url": Role.TEXT_FIELD,
+    "week": Role.TEXT_FIELD,
 }
 
 # Explicit [role="..."] → Touchpoint Role.
 _ARIA_ROLE_MAP: dict[str, Role] = {
     "alert": Role.ALERT,
     "alertdialog": Role.ALERT_DIALOG,
+    "application": Role.APPLICATION,
     "article": Role.ARTICLE,
+    "audio": Role.GROUP,
     "banner": Role.BANNER,
+    "blockquote": Role.SECTION,
     "button": Role.BUTTON,
     "cell": Role.TABLE_CELL,
     "checkbox": Role.CHECK_BOX,
+    "code": Role.TEXT,
     "combobox": Role.COMBO_BOX,
+    "comment": Role.NOTE,                # ARIA 1.3
     "complementary": Role.LANDMARK,
     "contentinfo": Role.CONTENT_INFO,
+    "definition": Role.SECTION,
+    "deletion": Role.SECTION,            # ARIA 1.3
     "dialog": Role.DIALOG,
     "document": Role.DOCUMENT,
+    "emphasis": Role.TEXT,               # ARIA 1.2
     "feed": Role.FEED,
     "figure": Role.FIGURE,
     "form": Role.FORM,
+    "generic": Role.SECTION,             # ARIA 1.2
     "grid": Role.GRID,
     "gridcell": Role.GRID_CELL,
     "group": Role.GROUP,
     "heading": Role.HEADING,
     "img": Role.IMAGE,
+    "insertion": Role.SECTION,           # ARIA 1.3
     "link": Role.LINK,
     "list": Role.LIST,
     "listbox": Role.LIST,
     "listitem": Role.LIST_ITEM,
     "log": Role.LOG,
     "main": Role.LANDMARK,
+    "mark": Role.TEXT,                   # ARIA 1.3
+    "marquee": Role.NOTIFICATION,
     "math": Role.MATH,
     "menu": Role.MENU,
     "menubar": Role.MENU_BAR,
@@ -337,6 +358,7 @@ _ARIA_ROLE_MAP: dict[str, Role] = {
     "navigation": Role.NAVIGATION,
     "note": Role.NOTE,
     "option": Role.LIST_ITEM,
+    "paragraph": Role.PARAGRAPH,         # ARIA 1.2
     "progressbar": Role.PROGRESS_BAR,
     "radio": Role.RADIO_BUTTON,
     "radiogroup": Role.GROUP,
@@ -351,18 +373,25 @@ _ARIA_ROLE_MAP: dict[str, Role] = {
     "slider": Role.SLIDER,
     "spinbutton": Role.SPIN_BUTTON,
     "status": Role.STATUS_BAR,
+    "strong": Role.TEXT,                 # ARIA 1.2
+    "subscript": Role.TEXT,              # ARIA 1.2
+    "suggestion": Role.SECTION,          # ARIA 1.3
+    "superscript": Role.TEXT,            # ARIA 1.2
     "switch": Role.SWITCH,
     "tab": Role.TAB,
     "table": Role.TABLE,
     "tablist": Role.TAB_LIST,
     "tabpanel": Role.TAB_PANEL,
+    "term": Role.SECTION,
     "textbox": Role.TEXT_FIELD,
+    "time": Role.TEXT,                   # ARIA 1.2
     "timer": Role.TIMER,
     "toolbar": Role.TOOLBAR,
     "tooltip": Role.TOOLTIP,
     "tree": Role.TREE,
     "treegrid": Role.TREE,
     "treeitem": Role.TREE_ITEM,
+    "video": Role.GROUP,
 }
 
 # ---------------------------------------------------------------------------
@@ -2286,7 +2315,7 @@ class CdpBackend(Backend):
         scrolling the element into view and computing its center
         coordinates.
         """
-        parts = self._parse_id(element_id)
+        parts = self._parse_id_or_raise(element_id, action)
         port = parts["port"]
         target_id = parts["target_id"]
         node_id = parts["node_id"]
@@ -2338,11 +2367,7 @@ class CdpBackend(Backend):
             port, target_id, node_id,
         )
         if backend_nid is None:
-            raise ActionFailedError(
-                action=action,
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+            raise make_element_not_found_error(action, element_id)
 
         if action_lower in ("click", "double_click", "right_click"):
             return self._click_element(
@@ -2364,7 +2389,7 @@ class CdpBackend(Backend):
         elements, focuses, optionally selects all existing text
         (for replace mode), then inserts the new text.
         """
-        parts = self._parse_id(element_id)
+        parts = self._parse_id_or_raise(element_id, "set_value")
         port = parts["port"]
         target_id = parts["target_id"]
         node_id = parts["node_id"]
@@ -2373,11 +2398,7 @@ class CdpBackend(Backend):
             port, target_id, node_id,
         )
         if backend_nid is None:
-            raise ActionFailedError(
-                action="set_value",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+            raise make_element_not_found_error("set_value", element_id)
 
         # Detect <select> elements for option-selection logic.
         try:
@@ -2514,7 +2535,7 @@ class CdpBackend(Backend):
         Uses ``Runtime.callFunctionOn`` to set the element's
         ``.value`` property and dispatch an ``input`` event.
         """
-        parts = self._parse_id(element_id)
+        parts = self._parse_id_or_raise(element_id, "set_numeric_value")
         port = parts["port"]
         target_id = parts["target_id"]
         node_id = parts["node_id"]
@@ -2523,10 +2544,8 @@ class CdpBackend(Backend):
             port, target_id, node_id,
         )
         if backend_nid is None:
-            raise ActionFailedError(
-                action="set_numeric_value",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
+            raise make_element_not_found_error(
+                "set_numeric_value", element_id,
             )
 
         # Resolve to a RemoteObject for JS evaluation.
@@ -2582,7 +2601,7 @@ class CdpBackend(Backend):
 
         Uses ``DOM.focus()`` with the element's backendNodeId.
         """
-        parts = self._parse_id(element_id)
+        parts = self._parse_id_or_raise(element_id, "focus")
         port = parts["port"]
         target_id = parts["target_id"]
         node_id = parts["node_id"]
@@ -2591,11 +2610,7 @@ class CdpBackend(Backend):
             port, target_id, node_id,
         )
         if backend_nid is None:
-            raise ActionFailedError(
-                action="focus",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+            raise make_element_not_found_error("focus", element_id)
 
         try:
             self._send(port, target_id, "DOM.focus", {
@@ -2609,17 +2624,93 @@ class CdpBackend(Backend):
                 reason=f"DOM.focus failed: {exc}",
             ) from exc
 
+    def get_text_content(self, element_id: str) -> str | None:
+        """Return the full text content of a CDP element via JavaScript.
+
+        For ``<input>`` and ``<textarea>`` elements returns ``element.value``
+        (the user-editable text).  For all other elements concatenates all
+        visible text nodes (excluding ``<script>``, ``<style>``,
+        ``<noscript>`` content) using the same TreeWalker traversal order
+        as ``select_text()``.  This keeps character offsets consistent
+        between the two methods.
+
+        Returns ``None`` when the element cannot be resolved or the JS call
+        fails.  Returns ``""`` when the element is accessible but empty.
+        """
+        parts = self._parse_id(element_id)
+        port = parts["port"]
+        target_id = parts["target_id"]
+        node_id = parts["node_id"]
+
+        backend_nid = self._resolve_backend_node_id(port, target_id, node_id)
+        if backend_nid is None:
+            return None
+
+        object_id: str | None = None
+        try:
+            resolve_result = self._send(
+                port, target_id, "DOM.resolveNode",
+                {"backendNodeId": backend_nid},
+            )
+            object_id = resolve_result.get("object", {}).get("objectId")
+            if not object_id:
+                return None
+
+            result = self._send(port, target_id, "Runtime.callFunctionOn", {
+                "objectId": object_id,
+                "functionDeclaration": (
+                    "function() {"
+                    "  if (this.nodeType === 3) return this.textContent;"
+                    "  var tag = this.tagName ? this.tagName.toLowerCase() : '';"
+                    "  if (tag === 'input' || tag === 'textarea') return this.value;"
+                    "  var filter = {acceptNode: function(n) {"
+                    "    for (var p = n.parentNode; p; p = p.parentNode) {"
+                    "      var t = p.tagName;"
+                    "      if (t==='SCRIPT'||t==='STYLE'||t==='NOSCRIPT')"
+                    "        return NodeFilter.FILTER_REJECT;"
+                    "    }"
+                    "    return NodeFilter.FILTER_ACCEPT;"
+                    "  }};"
+                    "  var tw = document.createTreeWalker("
+                    "    this, NodeFilter.SHOW_TEXT, filter, false);"
+                    "  var parts = [], node;"
+                    "  while ((node = tw.nextNode())) parts.push(node.textContent);"
+                    "  return parts.join('');"
+                    "}"
+                ),
+                "returnByValue": True,
+            })
+            value = result.get("result", {}).get("value")
+            if value is None:
+                return None
+            return str(value)
+        except Exception:
+            return None
+        finally:
+            if object_id:
+                try:
+                    self._send(port, target_id, "Runtime.releaseObject",
+                               {"objectId": object_id})
+                except Exception:
+                    pass
+
     def select_text(
         self, element_id: str, start: int, end: int,
     ) -> bool:
         """Select a range of text within a CDP element.
 
-        For ``<input>`` and ``<textarea>`` elements, uses
-        ``setSelectionRange()``.  For contentEditable elements
-        and other text nodes, uses the ``Selection`` API with
-        ``setBaseAndExtent()``.
+        For ``<input>`` / ``<textarea>`` elements uses
+        ``setSelectionRange()``.  For bare text nodes uses
+        ``createRange().setStart/setEnd`` directly.  For all other
+        elements (including read-only ``<p>``, ``<section>``,
+        ``<article>``, etc.) uses a ``TreeWalker`` to map character
+        offsets onto DOM text nodes and then applies a
+        ``Selection`` range.
+
+        Offsets are based on raw text-node character counts, matching
+        the string returned by ``get_text_content()``.
         """
-        parts = self._parse_id(element_id)
+        parts = self._parse_id_or_raise(element_id, "select_text")
         port = parts["port"]
         target_id = parts["target_id"]
         node_id = parts["node_id"]
@@ -2628,11 +2719,7 @@ class CdpBackend(Backend):
             port, target_id, node_id,
         )
         if backend_nid is None:
-            raise ActionFailedError(
-                action="select_text",
-                element_id=element_id,
-                reason="element not found in the accessibility tree",
-            )
+            raise make_element_not_found_error("select_text", element_id)
 
         # Focus the element first.
         try:
@@ -2678,34 +2765,35 @@ class CdpBackend(Backend):
                     "    sel.addRange(range);"
                     "    return true;"
                     "  }"
-                    "  var el = this;"
-                    "  if (!el.isContentEditable) {"
-                    "    while (el && !el.isContentEditable) el = el.parentElement;"
-                    "  }"
-                    "  if (el) {"
-                    "    var tw = document.createTreeWalker("
-                    "      el, NodeFilter.SHOW_TEXT, null, false);"
-                    "    var node, charCount = 0, startNode, startOff, endNode, endOff;"
-                    "    while ((node = tw.nextNode())) {"
-                    "      var len = node.textContent.length;"
-                    "      if (!startNode && charCount + len > s) {"
-                    "        startNode = node; startOff = s - charCount;"
-                    "      }"
-                    "      if (!endNode && charCount + len >= e) {"
-                    "        endNode = node; endOff = e - charCount; break;"
-                    "      }"
-                    "      charCount += len;"
+                    "  var filter = {acceptNode: function(n) {"
+                    "    for (var p = n.parentNode; p; p = p.parentNode) {"
+                    "      var t = p.tagName;"
+                    "      if (t==='SCRIPT'||t==='STYLE'||t==='NOSCRIPT')"
+                    "        return NodeFilter.FILTER_REJECT;"
                     "    }"
-                    "    if (!startNode || !endNode) return false;"
-                    "    var sel = window.getSelection();"
-                    "    var range = document.createRange();"
-                    "    range.setStart(startNode, startOff);"
-                    "    range.setEnd(endNode, endOff);"
-                    "    sel.removeAllRanges();"
-                    "    sel.addRange(range);"
-                    "    return true;"
+                    "    return NodeFilter.FILTER_ACCEPT;"
+                    "  }};"
+                    "  var tw = document.createTreeWalker("
+                    "    this, NodeFilter.SHOW_TEXT, filter, false);"
+                    "  var node, charCount = 0, startNode, startOff, endNode, endOff;"
+                    "  while ((node = tw.nextNode())) {"
+                    "    var len = node.textContent.length;"
+                    "    if (!startNode && charCount + len > s) {"
+                    "      startNode = node; startOff = s - charCount;"
+                    "    }"
+                    "    if (!endNode && charCount + len >= e) {"
+                    "      endNode = node; endOff = e - charCount; break;"
+                    "    }"
+                    "    charCount += len;"
                     "  }"
-                    "  return false;"
+                    "  if (!startNode || !endNode) return false;"
+                    "  var sel = window.getSelection();"
+                    "  var range = document.createRange();"
+                    "  range.setStart(startNode, startOff);"
+                    "  range.setEnd(endNode, endOff);"
+                    "  sel.removeAllRanges();"
+                    "  sel.addRange(range);"
+                    "  return true;"
                     "}"
                 ),
                 "arguments": [{"value": start}, {"value": end}],
@@ -2716,8 +2804,7 @@ class CdpBackend(Backend):
                 raise ActionFailedError(
                     action="select_text",
                     element_id=element_id,
-                    reason="element does not support text selection "
-                           "(not an input, textarea, or contentEditable)",
+                    reason="no text found within element at the requested offset",
                 )
             return True
         except ActionFailedError:
@@ -2764,6 +2851,23 @@ class CdpBackend(Backend):
             return False
 
     # -- Private helpers --------------------------------------------------
+
+    def _parse_id_or_raise(
+        self, element_id: str, action: str,
+    ) -> dict[str, Any]:
+        """Like :meth:`_parse_id` but raises :class:`ActionFailedError` instead of ``ValueError``.
+
+        Use from action methods so malformed IDs surface uniformly.
+        Read-only query methods can keep calling :meth:`_parse_id`
+        directly to let ``ValueError`` propagate per the ABC contract.
+        """
+        try:
+            return self._parse_id(element_id)
+        except ValueError as exc:
+            raise make_malformed_element_id_error(
+                action, element_id,
+                "cdp:<port>:<target_id>[:<node_id>|:dom:<x>,<y>]",
+            ) from exc
 
     def _parse_id(self, id_str: str) -> dict[str, Any]:
         """Parse a CDP element/window ID.

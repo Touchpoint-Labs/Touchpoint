@@ -28,9 +28,9 @@ Thumbs.db
 .coverage
 htmlcov/
 .pytest_cache/
+CLAUDE.md
 
 # Claude Code / AI tooling
-CLAUDE.md
 .claude/
 
 # Environment

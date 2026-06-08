@@ -6,7 +6,7 @@ Copilot agents, or any MCP-compatible client.
 
 Install::
 
-    pip install touchpoint-py
+    pip install touchpoint
 
 Run::
 

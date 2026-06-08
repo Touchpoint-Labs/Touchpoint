@@ -18,14 +18,14 @@
   </p>
 </p>
 
-<p align="center"><img src="docs/demo.gif" width="720" alt="Touchpoint demo — AI agent creates a formatted Excel table using Touchpoint"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Touchpoint-Labs/touchpoint/main/docs/demo.gif" width="720" alt="Touchpoint demo — AI agent creates a formatted Excel table using Touchpoint"></p>
 <p align="center"><em>AI agent researches data in Chrome, then creates a formatted Excel table — full task completed in ~12 minutes</em></p>
 
 ---
 
 Touchpoint is a **cross-platform Python library** for reading and interacting with desktop UI through native accessibility APIs. One import, one API — works on Linux, macOS, and Windows, with built-in support for Chromium and Electron apps via CDP (Chrome DevTools Protocol).
 
-Instead of scraping pixels or running vision models, Touchpoint reads the real accessibility tree — structured names, roles, states, and positions for every element on screen. Fast and reliable, with no model inference needed. Ships with an MCP server so LLM agents like Claude or Cursor can control any desktop app out of the box.
+Instead of scraping pixels or running vision models, Touchpoint reads the real accessibility tree — structured names, roles, states, and positions for every element on screen. Fast and reliable, with **no vision model required**. Ships with an MCP server so LLM agents like Claude, Cursor, or any local model can control any desktop app out of the box.
 
 ```python
 import touchpoint as tp
@@ -38,10 +38,11 @@ tp.click(elements[0])
 
 | | Screenshot / vision | Browser automation | **Touchpoint** |
 |---|---|---|---|
-| Native desktop apps | ⚠️ inaccurate or slow | ❌ | ✅ structured access |
+| Native desktop apps | ⚠️ inaccurate or slow | ❌ | ✅ |
 | Browsers | ⚠️ inaccurate or slow | ✅ | ✅ via CDP |
 | Electron apps (Slack, VS Code, ...) | ⚠️ inaccurate or slow | ⚠️ web content only | ✅ native + web |
-| Structured element data | ❌ needs OCR/vision models | ✅ web only | ✅ names, roles, states, positions |
+| Structured element data | ❌ needs OCR/vision model | ✅ web only | ✅ names, roles, states, positions |
+| Works with local / non-vision models | ❌ | ✅ web only | ✅ all apps |
 | Works across Linux, macOS, Windows | ✅ | ✅ | ✅ |
 
 ---
@@ -89,7 +90,7 @@ Everything is included: your platform's native backend, CDP support for browsers
 
 | Platform | Backend | Requirement |
 |----------|---------|-------------|
-| **Linux** | AT-SPI2 | Install `xdotool` for input. Most desktops include `python3-gi` and `gir1.2-atspi-2.0` — install them if missing. |
+| **Linux** | AT-SPI2 | Install `xdotool` (required for input + `minimize_window`) and `wmctrl` (required for all window management — used for AT-SPI → X11 id mapping). Most desktops include `python3-gi` and `gir1.2-atspi-2.0` — install them if missing. |
 | **Windows** | UI Automation | None — uses built-in COM APIs |
 | **macOS** | Accessibility (AX) | Grant permission: System Settings → Privacy & Security → Accessibility |
 
@@ -147,21 +148,30 @@ tp.elements(app="Slack", format="json")     # full JSON with all fields
 
 ## MCP Server
 
-Touchpoint ships an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server with **20 tools**, ready for any MCP-compatible client. Use it to let LLM agents like Claude, Cursor, or Copilot control your desktop.
+Touchpoint ships an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server ready for any MCP-compatible client. Use it to let LLM agents like Claude, Cursor, local models, or any tool that supports MCP control your desktop.
+
+### Two modes — vision and no-vision
+
+Set `TOUCHPOINT_MODE=no-vision` (default: `vision`) to switch modes:
+
+- **Vision mode** — agents use `screenshot()` to see the screen and interact by element ID or coordinates. Best for frontier models with strong vision capabilities.
+- **No-vision mode** — agents use `snapshot()` to get a compact structured text tree of the active window, then act on element IDs directly. Works with **any model including local ones that have no vision capability**. Most action tools append auto-verify flags (`(new window: ...)`, `(focus moved)`, `(no change detected)`) so the agent can detect state changes without taking a screenshot.
 
 ### Tools
 
-| Category | Tools |
-|----------|-------|
-| **Discovery** | `apps`, `windows`, `find`, `elements`, `get_element` |
-| **Screenshot** | `screenshot` (returns image data the LLM can see) |
-| **Actions** | `click` (left/right/double), `set_value`, `set_numeric_value`, `select_text`, `focus`, `action` |
-| **Keyboard** | `type_text`, `press_key` (single key or combo) |
-| **Mouse** | `mouse_move`, `scroll` |
-| **Window** | `activate_window` |
-| **Waiting** | `wait_for`, `wait_for_app`, `wait_for_window` |
+| Category | Vision mode | No-vision mode |
+|----------|------------|----------------|
+| **Orient** | `screenshot`, `snapshot`, `apps`, `windows` | `snapshot`, `diff_snapshot`, `apps`, `windows` |
+| **Find** | `find`, `get_element` | `find` |
+| **Read** | `read_text` | `read_text` |
+| **Actions** | `click` (element or coordinates), `set_value`, `set_numeric_value`, `select_text`, `focus`, `action` | `click` (element only), `set_value`, `set_numeric_value`, `select_text`, `focus`, `action` |
+| **Keyboard** | `type_text`, `press_key` | `type_text`, `press_key` |
+| **Mouse** | `mouse_move`, `scroll` | `scroll` |
+| **Window** | `activate_window`, `minimize_window`, `fullscreen_window`, `close_window`, `move_window`, `resize_window` | `activate_window`, `minimize_window`, `fullscreen_window`, `close_window` |
+| **Waiting** | `wait_for`, `wait_for_app`, `wait_for_window` | `wait_for`, `wait_for_app`, `wait_for_window` |
+| **Health** | `diagnostics` | `diagnostics` |
 
-The MCP server includes built-in instructions that teach LLM agents how to work effectively — the **orient → locate → act → verify** loop, how to use `find()`, and how to recover from errors.
+The MCP server includes built-in instructions that teach agents the correct workflow for each mode — including the **orient → act → verify** loop, when to use `read_text` vs `find`, and how to recover from errors.
 
 ```
          ┌──────────┐
@@ -169,7 +179,7 @@ The MCP server includes built-in instructions that teach LLM agents how to work 
     │    └────┬─────┘
     │         ▼
     │    ┌──────────┐
-    │    │  LOCATE  │  find · elements · get_element
+    │    │  LOCATE  │  find · snapshot · get_element
     │    └────┬─────┘
     │         ▼
     │    ┌──────────┐
@@ -301,7 +311,8 @@ Add to `mcpServers` in `~/.openclaw/openclaw.json`:
 | `TOUCHPOINT_FUZZY_THRESHOLD` | `0.6` | Minimum match score for find() (0.0–1.0) |
 | `TOUCHPOINT_FALLBACK_INPUT` | `true` | Use coordinate fallback when native actions fail |
 | `TOUCHPOINT_MAX_ELEMENTS` | `5000` | Maximum elements per query |
-| `TOUCHPOINT_MAX_DEPTH` | `10` | Default tree depth limit |
+| `TOUCHPOINT_MAX_DEPTH` | `20` | Default tree depth limit |
+| `TOUCHPOINT_AX_MESSAGING_TIMEOUT` | `1.0` | Max seconds to wait for a macOS AX app reply |
 
 </details>
 
@@ -342,12 +353,16 @@ tp.configure(cdp_ports={"Google Chrome": 9222})  # explicit mapping
 
 ```python
 tp.elements(app="Google Chrome", source="full")     # native chrome + web content (default)
-tp.elements(app="Google Chrome", source="ax")       # web content only (CDP accessibility tree)
+tp.elements(app="Google Chrome", source="cdp_ax")   # web content only (CDP accessibility tree)
 tp.elements(app="Google Chrome", source="native")   # native UI only (toolbar, tabs, menus)
 tp.elements(app="Google Chrome", source="dom")      # DOM walker (catches what AX misses)
 ```
 
 CDP results are merged with native backend results — you get the toolbar and window controls from AT-SPI2/UIA/AX, combined with the full web page content from CDP, in a single `elements()` call.
+
+`source="ax"` remains accepted as a compatibility alias for
+`source="cdp_ax"`. Prefer `cdp_ax` in new code so it is not confused with
+the native macOS AX backend.
 
 ---
 
@@ -381,10 +396,16 @@ CDP results are merged with native backend results — you get the toolbar and w
 | `tp.right_click(element)` | Right-click / context menu |
 | `tp.set_value(element, text)` | Set text content (`replace=True` to clear first) |
 | `tp.set_numeric_value(element, n)` | Set slider or spinbox value |
-| `tp.select_text(element, text, occurrence=1)` | Select a substring within text content (Linux + web) |
+| `tp.select_text(element, text)` | Select a substring within text content across Linux, Windows, macOS, and web/CDP |
+| `tp.select_text_range(element, start, end)` | Select a character range when you already know the offsets |
 | `tp.focus(element)` | Move keyboard focus |
 | `tp.action(element, name)` | Execute a raw accessibility action by name |
-| `tp.activate_window(window)` | Bring a window to the foreground |
+| `tp.activate_window(window)` | Bring a window to the foreground (restores from minimized) |
+| `tp.minimize_window(window)` | Minimize a window. Use `activate_window` to restore. |
+| `tp.fullscreen_window(window, fullscreen=True)` | Enter or exit fullscreen for a window |
+| `tp.close_window(window)` | Politely close a window |
+| `tp.move_window(window, x, y)` | Move a window to a new screen position |
+| `tp.resize_window(window, width, height)` | Resize a window to width × height pixels |
 
 ### Input
 
@@ -406,8 +427,9 @@ CDP results are merged with native backend results — you get the toolbar and w
 | `tp.screenshot(app, element, ...)` | Full desktop or cropped to app/window/element/monitor |
 | `tp.monitor_count()` | Number of connected monitors |
 | `tp.configure(...)` | Set runtime options (see [Configuration](#configuration)) |
+| `tp.diagnostics()` | Report backend, input, CDP, timeout, and dependency health |
 
-All action functions accept an `Element` object or a string ID. `elements()`, `find()`, and `get_element()` support `format="flat"`, `format="json"`, or `format="tree"` (elements only) to return pre-formatted strings instead of objects.
+All action functions accept an `Element` object or a string ID. `elements()`, `find()`, and `get_element()` support `format="flat"`, `format="json"`, or `format="tree"` (elements only) to return pre-formatted strings instead of objects. Window management is implemented across Linux AT-SPI2, Windows UIA, and macOS AX backends.
 
 ---
 
@@ -449,13 +471,18 @@ tp.configure(
     fallback_input=True,          # use InputProvider when native actions fail
     type_chunk_size=40,           # split long text into chunks for typing (0 = disable)
     max_elements=5000,            # max elements per query
-    max_depth=10,                 # default tree depth limit
+    max_depth=20,                 # default tree depth limit
     scale_factor=None,            # display scale override (None = auto-detect)
     cdp_ports={"Chrome": 9222},   # explicit CDP port mapping
     cdp_discover=True,            # auto-discover CDP ports from running processes
     cdp_refresh_interval=5.0,     # seconds between CDP target scans
+    ax_messaging_timeout=1.0,     # max seconds to wait for a macOS AX app reply
 )
 ```
+
+`tp.diagnostics()` returns a JSON-friendly health report. It includes the
+active backend, input provider, CDP targets, optional platform tools, configured
+timeouts, and macOS apps recently skipped after an AX messaging timeout.
 
 ---
 
@@ -489,6 +516,10 @@ pytest
 
 - **No browser navigation API** — Touchpoint doesn't have built-in URL navigation. Agents can navigate by interacting with UI elements directly: find the address bar, type a URL, press Enter.
 
+- **CDP windows are page targets, not OS windows** — but window management still works: `tp.activate_window()` brings the target forward via CDP, and `minimize`/`fullscreen`/`close`/`move`/`resize` on a surfaced `cdp:` window are routed to the underlying native OS window (resolved by owning PID) and handled by the platform backend. They raise `ActionFailedError` only if no native OS window for that target can be found (e.g. it has been closed).
+
+- **Backend role/state parity is still uneven** — macOS AX and Windows UIA both improved significantly in `0.3.0`, but Windows still relies on more heuristics and has more unmapped long-tail roles than the other backends.
+
 ---
 
 ## Roadmap
@@ -497,15 +528,11 @@ pytest
 - **Async CDP architecture** — non-blocking WebSocket, proper dialog queuing, concurrent multi-tab queries
 
 ### Medium Priority
-- **Text selection tool** — select text within an element by content (e.g. "select this word"), across all backends
-- **Window management tools** — minimize, maximize, close, move, resize windows
-- **Backend role/state parity** — close remaining role mapping gaps (especially UIA on Windows)
-- **Batch action tool** — execute a sequence of actions in one call to reduce LLM round trips
+- **Backend role/state parity** — close remaining role mapping gaps, especially UIA long-tail roles on Windows
 - **Wayland input backend** — `libei` / `xdg-desktop-portal` RemoteDesktop when X11 isn't available
 
 ### Lower Priority
 - Tooltip and notification visibility
-- Code organisation (split large files)
 - Element caching
 
 ---

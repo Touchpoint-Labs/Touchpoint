@@ -16,8 +16,79 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from touchpoint.core.element import Element
+from touchpoint.core.exceptions import ActionFailedError
 from touchpoint.core.types import Role, State
 from touchpoint.core.window import Window
+
+
+# ---------------------------------------------------------------------------
+# Shared error builders for backend window- and element-targeted methods.
+#
+# Each backend has its own id format (atspi:.../ax:.../uia:.../cdp:...),
+# but the failure types are the same: malformed input vs not-found vs
+# operational failure.  These helpers keep the error messages uniform
+# across backends so agents get a consistent UX.
+# ---------------------------------------------------------------------------
+
+
+def make_malformed_window_id_error(
+    action: str,
+    window_id: str,
+    expected_format: str,
+) -> ActionFailedError:
+    """Build a 'malformed window_id' error with a backend-specific format hint.
+
+    The format hint alone is enough — agents (and humans) can see the
+    expected shape and figure out what's wrong with their input.  We
+    deliberately don't try to enumerate *why* the id was rejected
+    (wrong prefix, wrong length, wrong types) — that'd add noise without
+    changing what the caller needs to do.
+    """
+    return ActionFailedError(
+        action=action,
+        element_id=window_id,
+        reason=f"malformed window_id (expected '{expected_format}')",
+    )
+
+
+def make_window_not_found_error(
+    action: str, window_id: str,
+) -> ActionFailedError:
+    """Build the standard 'window not found' error."""
+    return ActionFailedError(
+        action=action,
+        element_id=window_id,
+        reason="window not found — it may have been closed or its ID is stale",
+    )
+
+
+def make_malformed_element_id_error(
+    action: str,
+    element_id: str,
+    expected_format: str,
+) -> ActionFailedError:
+    """Build a 'malformed element_id' error with a backend-specific format hint."""
+    return ActionFailedError(
+        action=action,
+        element_id=element_id,
+        reason=f"malformed element_id (expected '{expected_format}')",
+    )
+
+
+def make_element_not_found_error(
+    action: str, element_id: str,
+) -> ActionFailedError:
+    """Build the standard 'element not found' error.
+
+    The element may have been destroyed (e.g. the window closed, the
+    DOM node was removed) or the id may simply be stale.  Agents
+    should re-discover via :func:`find` or :func:`snapshot`.
+    """
+    return ActionFailedError(
+        action=action,
+        element_id=element_id,
+        reason="element not found — it may have been removed or its ID is stale",
+    )
 
 
 class Backend(ABC):
@@ -312,24 +383,103 @@ class Backend(ABC):
                 selection or the operation fails.
         """
 
+
+    @abstractmethod
+    def get_text_content(self, element_id: str) -> str | None:
+        """Return the full text content of an element.
+
+        Used by :func:`touchpoint.select_text` to locate a substring and
+        compute character offsets, and by :func:`touchpoint.get_text_content`
+        to read an element's prose text.
+
+        Returns:
+            The element's full text, ``""`` for an accessible but empty
+            element, or ``None`` if the element has no text interface.
+        """
+
+
     # -- Window management ------------------------------------------------
 
     def activate_window(self, window_id: str) -> bool:
-        """Bring a window to the foreground.
+        """Bring a window to the foreground and focus it.
 
-        Uses the accessibility framework's native mechanism to
-        activate (raise and focus) a window.
-
-        Not every backend can do this — the default returns
-        ``False``.  Subclasses that support it should override.
+        Restores the window if it is minimized.
 
         Args:
-            window_id: The id of the window to activate (as
-                returned in :attr:`Window.id`).
+            window_id: The id of the window to activate.
 
         Returns:
             ``True`` if the window was activated, ``False`` if
-            this backend does not support window activation.
+            this backend does not support it.
+        """
+        return False
+
+    def minimize_window(self, window_id: str) -> bool:
+        """Minimize a window.
+
+        Use :meth:`activate_window` to restore.
+
+        Args:
+            window_id: The id of the target window.
+
+        Returns:
+            ``True`` if the window was minimized, ``False`` if
+            this backend does not support it.
+        """
+        return False
+
+    def fullscreen_window(
+        self, window_id: str, fullscreen: bool = True,
+    ) -> bool:
+        """Enter or exit fullscreen for a window.
+
+        Args:
+            window_id: The id of the target window.
+            fullscreen: ``True`` to enter fullscreen, ``False`` to exit.
+
+        Returns:
+            ``True`` if the operation succeeded, ``False`` if
+            this backend does not support it.
+        """
+        return False
+
+    def close_window(self, window_id: str) -> bool:
+        """Close a window.
+
+        Args:
+            window_id: The id of the window to close.
+
+        Returns:
+            ``True`` if the window was closed, ``False`` if
+            this backend does not support it.
+        """
+        return False
+
+    def move_window(self, window_id: str, x: int, y: int) -> bool:
+        """Move a window to a new position.
+
+        Args:
+            window_id: The id of the target window.
+            x: New horizontal position (top-left corner).
+            y: New vertical position (top-left corner).
+
+        Returns:
+            ``True`` if the window was moved, ``False`` if
+            this backend does not support it.
+        """
+        return False
+
+    def resize_window(self, window_id: str, width: int, height: int) -> bool:
+        """Resize a window.
+
+        Args:
+            window_id: The id of the target window.
+            width: New width in pixels.
+            height: New height in pixels.
+
+        Returns:
+            ``True`` if the window was resized, ``False`` if
+            this backend does not support it.
         """
         return False
 

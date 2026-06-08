@@ -9,7 +9,7 @@ origin at the **top-left** of the primary display, matching the
 coordinate space used by the macOS Accessibility API (AX).
 
 Requires:
-    - ``pyobjc-framework-Quartz`` (installed automatically with ``pip install touchpoint-py``)
+    - ``pyobjc-framework-Quartz`` (installed automatically with ``pip install touchpoint``)
     - macOS Accessibility permission must be granted for the Python
       process in System Settings → Privacy & Security → Accessibility.
 
