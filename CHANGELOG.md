@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tp.configure()` is now also a getter** — calling it with no arguments
   returns a copy of the current configuration.
 
+### Removed
+- **The `elements` MCP tool** has been replaced by `snapshot()`, which returns
+  a compact structured tree of the active window (in both vision and no-vision
+  modes). The `tp.elements()` Python API is unchanged.
+
 ### Fixed
 - **CDP windows now support OS-level window management.** Minimize, fullscreen,
   close, move, and resize on a browser/Electron page are routed to the
